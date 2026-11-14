@@ -20,10 +20,18 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-#ifndef AUSTIN_H
-#define AUSTIN_H
+#pragma once
 
-#define PROGRAM_NAME                    "austin"
-#define VERSION                         "3.3.0"
+#include "platform.h"
 
+#if defined(AUSTINP) && defined(PL_LINUX)
+#define PROGRAM_NAME "austinp"
+#else
+#define PROGRAM_NAME "austin"
 #endif
+/* [[[cog
+from scripts.utils import get_current_version_from_changelog as version
+print(f'#define VERSION "{version()}"')
+]]] */
+#define VERSION "4.1.0"
+// [[[end]]]

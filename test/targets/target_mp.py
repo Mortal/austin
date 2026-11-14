@@ -40,9 +40,16 @@ def do(N):
 
 
 if __name__ == "__main__":
+    import sys
+
+    try:
+        nproc = int(sys.argv[1])
+    except Exception:
+        nproc = 2
+
     processes = []
-    for _ in range(2):
-        process = multiprocessing.Process(target=do, args=(3000,))
+    for _ in range(nproc):
+        process = multiprocessing.Process(target=do, args=(2800,))
         process.start()
         processes.append(process)
 

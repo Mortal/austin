@@ -23,177 +23,556 @@
 #ifdef PY_PROC_C
 
 #include <psapi.h>
+#include <string.h>
 #include <tlhelp32.h>
+#include <winternl.h>
 
 #include "../py_proc.h"
+#include "../py_thread.h"
+#include "../resources.h"
 
-
-#define CHECK_HEAP
-#define DEREF_SYM
-
-
-#define MODULE_CNT                     2
-#define SYMBOLS                        2
-
-#define PROC_REF                        ((long long int) self->extra->h_proc)
-
+#define MODULE_CNT 2
+#define SYMBOLS    2
 
 struct _proc_extra_info {
-  HANDLE h_proc;
-  HANDLE h_reader_thread;
+    HANDLE h_reader_thread;
+    HANDLE h_job;
 };
-
 
 // ----------------------------------------------------------------------------
 // TODO: Optimise by avoiding executing the same code over and over again
-static void *
-map_addr_from_rva(void * bin, DWORD rva) {
-  IMAGE_DOS_HEADER     * dos_hdr = (IMAGE_DOS_HEADER *) bin;
-  IMAGE_NT_HEADERS     * nt_hdr  = (IMAGE_NT_HEADERS *) (bin + dos_hdr->e_lfanew);
-  IMAGE_SECTION_HEADER * s_hdr   = (IMAGE_SECTION_HEADER *) (bin + dos_hdr->e_lfanew + sizeof(IMAGE_NT_HEADERS));
+static void*
+map_addr_from_rva(void* bin, DWORD rva) {
+    IMAGE_DOS_HEADER*     dos_hdr = (IMAGE_DOS_HEADER*)bin;
+    IMAGE_NT_HEADERS*     nt_hdr  = (IMAGE_NT_HEADERS*)(bin + dos_hdr->e_lfanew);
+    IMAGE_SECTION_HEADER* s_hdr   = (IMAGE_SECTION_HEADER*)(bin + dos_hdr->e_lfanew + sizeof(IMAGE_NT_HEADERS));
 
-  for (register int i = 0; i < nt_hdr->FileHeader.NumberOfSections; i++) {
-    if (rva >= s_hdr[i].VirtualAddress && rva < s_hdr[i].VirtualAddress + s_hdr[i].SizeOfRawData)
-      return bin + s_hdr[i].PointerToRawData + (rva - s_hdr[i].VirtualAddress);
-  }
+    for (register int i = 0; i < nt_hdr->FileHeader.NumberOfSections; i++) {
+        if (rva >= s_hdr[i].VirtualAddress && rva < s_hdr[i].VirtualAddress + s_hdr[i].SizeOfRawData)
+            return bin + s_hdr[i].PointerToRawData + (rva - s_hdr[i].VirtualAddress);
+    }
 
-  return NULL;
+    return NULL;
 }
 
+// ----------------------------------------------------------------------------
+// Helper to compare file paths that might differ in e.g. the case. Here we use
+// the file information to reliably determine if two paths refer to the same
+// file.
+static int
+pathcmp(char* a, char* b) {
+    cu_HANDLE ha = CreateFile(a, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    cu_HANDLE hb = CreateFile(b, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+
+    BY_HANDLE_FILE_INFORMATION ia, ib;
+    GetFileInformationByHandle(ha, &ia);
+    GetFileInformationByHandle(hb, &ib);
+
+    return !(
+        ia.dwVolumeSerialNumber == ib.dwVolumeSerialNumber && ia.nFileIndexLow == ib.nFileIndexLow
+        && ia.nFileIndexHigh == ib.nFileIndexHigh
+    );
+}
 
 // ----------------------------------------------------------------------------
 static int
-_py_proc__analyze_pe(py_proc_t * self, char * path) {
-  HANDLE hFile    = CreateFile(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-  HANDLE hMapping = CreateFileMapping(hFile, NULL, PAGE_READONLY, 0, 0, 0);
-  LPVOID pMapping = MapViewOfFile(hMapping, FILE_MAP_READ, 0, 0, 0);
+_py_proc__analyze_pe(py_proc_t* self, char* path, void* base) {
+    cu_HANDLE hFile = CreateFile(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    cu_HANDLE hMapping = CreateFileMapping(hFile, NULL, PAGE_READONLY, 0, 0, 0);
+    cu_VOF    pMapping = MapViewOfFile(hMapping, FILE_MAP_READ, 0, 0, 0);
 
-  IMAGE_DOS_HEADER     * dos_hdr = (IMAGE_DOS_HEADER *)     pMapping;
-  IMAGE_NT_HEADERS     * nt_hdr  = (IMAGE_NT_HEADERS *)     (pMapping + dos_hdr->e_lfanew);
-  IMAGE_SECTION_HEADER * s_hdr   = (IMAGE_SECTION_HEADER *) (pMapping + dos_hdr->e_lfanew + sizeof(IMAGE_NT_HEADERS));
+    IMAGE_DOS_HEADER*     dos_hdr = (IMAGE_DOS_HEADER*)pMapping;
+    IMAGE_NT_HEADERS*     nt_hdr  = (IMAGE_NT_HEADERS*)(pMapping + dos_hdr->e_lfanew);
+    IMAGE_SECTION_HEADER* s_hdr   = (IMAGE_SECTION_HEADER*)(pMapping + dos_hdr->e_lfanew + sizeof(IMAGE_NT_HEADERS));
 
-  if (nt_hdr->Signature != IMAGE_NT_SIGNATURE)
-    self->sym_loaded = 0;
-
-  else {
-    void * base = self->map.bss.base;
+    if (nt_hdr->Signature != IMAGE_NT_SIGNATURE) {
+        set_error(BINARY, "Invalid PE file");
+        FAIL;
+    }
 
     // ---- Find the .data section ----
     for (register int i = 0; i < nt_hdr->FileHeader.NumberOfSections; i++) {
-      if (strcmp(".data", (const char *) s_hdr[i].Name) == 0) {
-        self->map.bss.base += s_hdr[i].VirtualAddress;
-        self->map.bss.size = s_hdr[i].Misc.VirtualSize;
-        break;
-      }
+        if (strcmp(".data", (const char*)s_hdr[i].Name) == 0) {
+            self->map.bss.base = base + s_hdr[i].VirtualAddress;
+            self->map.bss.size = s_hdr[i].Misc.VirtualSize;
+        } else if (strcmp("PyRuntime", (const char*)s_hdr[i].Name) == 0) {
+            self->map.runtime.base = base + s_hdr[i].VirtualAddress;
+            self->map.runtime.size = s_hdr[i].Misc.VirtualSize;
+        }
     }
 
     // ---- Search for exports ----
     self->sym_loaded = 0;
 
-    IMAGE_EXPORT_DIRECTORY * e_dir = (IMAGE_EXPORT_DIRECTORY *) map_addr_from_rva(
-      pMapping, nt_hdr->OptionalHeader.DataDirectory[0].VirtualAddress
-    );
+    IMAGE_EXPORT_DIRECTORY* e_dir
+        = (IMAGE_EXPORT_DIRECTORY*)map_addr_from_rva(pMapping, nt_hdr->OptionalHeader.DataDirectory[0].VirtualAddress);
     if (e_dir != NULL) {
-      DWORD * names   = (DWORD *) map_addr_from_rva(pMapping, e_dir->AddressOfNames);
-      WORD  * idx_tab = (WORD *)  map_addr_from_rva(pMapping, e_dir->AddressOfNameOrdinals);
-      DWORD * addrs   = (DWORD *) map_addr_from_rva(pMapping, e_dir->AddressOfFunctions);
-      for (
-        register int i = 0;
-        self->sym_loaded < SYMBOLS && i < e_dir->NumberOfNames;
-        i++
-      ) {
-        char * sym_name = (char *) map_addr_from_rva(pMapping, names[i]);
-        self->sym_loaded += _py_proc__check_sym(self, sym_name, addrs[idx_tab[i]] + base);
-      }
+        DWORD* names   = (DWORD*)map_addr_from_rva(pMapping, e_dir->AddressOfNames);
+        WORD*  idx_tab = (WORD*)map_addr_from_rva(pMapping, e_dir->AddressOfNameOrdinals);
+        DWORD* addrs   = (DWORD*)map_addr_from_rva(pMapping, e_dir->AddressOfFunctions);
+        for (register int i = 0; self->sym_loaded < SYMBOLS && i < e_dir->NumberOfNames; i++) {
+            char* sym_name    = (char*)map_addr_from_rva(pMapping, names[i]);
+            self->sym_loaded += _py_proc__check_sym(self, sym_name, addrs[idx_tab[i]] + base);
+        }
     }
-  }
 
-  UnmapViewOfFile(pMapping);
-  CloseHandle(hMapping);
-  CloseHandle(hFile);
+    if (!self->sym_loaded) {
+        set_error(BINARY, "No symbols found");
+        FAIL;
+    }
 
-  return !self->sym_loaded;
+    SUCCESS;
 }
 
+// ----------------------------------------------------------------------------
+// On Windows, if we fail with the parent process we look if it has a single
+// child and try to attach to that instead. We keep going until we either find
+// a single Python process or more or less than a single child.
+static int
+_py_proc__try_child_proc(py_proc_t* self) {
+    cu_HANDLE h = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (h == INVALID_HANDLE_VALUE) {
+        set_error(OS, "Failed to create process snapshot");
+        FAIL;
+    }
+
+    HANDLE orig_hproc = self->ref;
+    pid_t  orig_pid   = self->pid;
+
+    for (;;) {
+        pid_t parent_pid = self->pid;
+
+        PROCESSENTRY32 pe = {0};
+        pe.dwSize         = sizeof(PROCESSENTRY32);
+
+        if (Process32First(h, &pe)) {
+            pid_t child_pid = 0;
+            do {
+                if (pe.th32ParentProcessID == parent_pid) {
+                    if (child_pid) {
+                        log_d("Process has more than one child");
+                        goto rollback;
+                    }
+                    child_pid = pe.th32ProcessID;
+                }
+            } while (Process32Next(h, &pe));
+
+            if (!child_pid) {
+                log_d("Process has no children");
+                goto rollback;
+            }
+
+            self->pid = child_pid;
+            self->ref = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, child_pid);
+            if (self->ref == INVALID_HANDLE_VALUE) {
+                log_e("Cannot open child process handle");
+                goto rollback;
+            }
+            if (success(py_proc__init(self))) {
+                log_d("Process has a single Python child with PID %d. We will attach to that", child_pid);
+                SUCCESS;
+            } else {
+                log_d("Process has a single non-Python child with PID %d. Taking it as new parent", child_pid);
+                CloseHandle(self->ref);
+            }
+        }
+    }
+
+rollback:
+    self->pid = orig_pid;
+    self->ref = orig_hproc;
+
+    set_error(OS, "Failed to find a single Python child process");
+    FAIL;
+}
 
 // ----------------------------------------------------------------------------
 static int
-_py_proc__get_modules(py_proc_t * self) {
-  HANDLE mod_hdl;
-  mod_hdl = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, self->pid);
-  if (mod_hdl == INVALID_HANDLE_VALUE)
-    FAIL;
-
-  MODULEENTRY32 module;
-  module.dwSize = sizeof(module);
-
-  self->min_raddr = (void *) -1;
-  self->max_raddr = NULL;
-
-  sfree(self->bin_path);
-  sfree(self->lib_path);
-
-  BOOL success = Module32First(mod_hdl, &module);
-  while (success) {
-    if ((void *) module.modBaseAddr < self->min_raddr)
-      self->min_raddr = module.modBaseAddr;
-
-    if ((void *) module.modBaseAddr + module.modBaseSize > self->max_raddr)
-      self->max_raddr = module.modBaseAddr + module.modBaseSize;
-
-    log_t(
-      "%p-%p:  Module %s",
-      module.modBaseAddr, module.modBaseAddr + module.modBaseSize,
-      module.szModule
-    );
-    if (
-      self->bin_path == NULL \
-      && strcmp(module.szModule, "py.exe") \
-      && strstr(module.szModule, ".exe") \
-    ) {
-      log_d("Candidate binary: %s (size %d KB)", module.szModule, module.modBaseSize >> 10);
-      self->bin_path = strdup(module.szExePath);
-    }
-    if (!self->sym_loaded && strstr(module.szModule, ".dll") && module.modBaseSize > (1 << 20)) {
-      self->map.bss.base = module.modBaseAddr;  // WARNING: Not the BSS base yet!
-      if (success(_py_proc__analyze_pe(self, module.szExePath))) {
-        log_d("Candidate library: %s (size %d KB)", module.szModule, module.modBaseSize >> 10);
-        sfree(self->lib_path);
-        self->lib_path = strdup(module.szExePath);
-      }
+_py_proc__get_modules(py_proc_t* self) {
+    cu_HANDLE mod_hdl;
+    mod_hdl = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, self->pid);
+    if (mod_hdl == INVALID_HANDLE_VALUE) {
+        set_error(OS, "Failed to create module snapshot");
+        FAIL;
     }
 
-    if (self->bin_path != NULL && self->lib_path != NULL && self->sym_loaded)
-      break;
+    MODULEENTRY32 module;
+    module.dwSize = sizeof(module);
 
-    success = Module32Next(mod_hdl, &module);
-  }
+    sfree(self->bin_path);
+    sfree(self->lib_path);
 
-  CloseHandle(mod_hdl);
+    cu_void* pd_mem = calloc(1, sizeof(struct proc_desc));
+    if (!isvalid(pd_mem)) {
+        set_error(MALLOC, "Failed to allocate memory for proc_desc");
+        FAIL;
+    }
+    struct proc_desc* pd          = pd_mem;
+    cu_char*          prev_path   = NULL;
+    cu_char*          needle_path = NULL;
+    struct vm_map*    map         = NULL;
 
-  return !self->sym_loaded;
+    if (GetModuleFileNameEx(self->ref, NULL, pd->exe_path, sizeof(pd->exe_path)) == 0) {
+        set_error(OS, "Failed to get executable path from module");
+        FAIL;
+    }
+    log_d("Executable path: %s", pd->exe_path);
+
+    if (!Module32First(mod_hdl, &module)) {
+        set_error(OS, "Failed to get first module");
+        FAIL;
+    }
+    do {
+        if (isvalid(prev_path) && strcmp(module.szExePath, prev_path) == 0) { // Avoid analysing a binary multiple times
+            continue;
+        }
+
+        sfree(prev_path);
+        prev_path = strdup(module.szExePath);
+        if (!isvalid(prev_path)) {
+            set_error(MALLOC, "Failed to allocate memory for previous path");
+            FAIL;
+        }
+
+        log_t("%p-%p:  Module %s", module.modBaseAddr, module.modBaseAddr + module.modBaseSize, module.szExePath);
+
+        // The first memory map of the executable
+        if (!isvalid(pd->maps[MAP_BIN].path) && pathcmp(pd->exe_path, module.szExePath) == 0) {
+            map       = &(pd->maps[MAP_BIN]);
+            map->path = strdup(module.szExePath);
+            if (!isvalid(map->path)) {
+                set_error(MALLOC, "Failed to allocate memory for map path");
+                FAIL;
+            }
+            map->file_size   = module.modBaseSize;
+            map->base        = (void*)module.modBaseAddr;
+            map->size        = module.modBaseSize;
+            map->has_symbols = success(_py_proc__analyze_pe(self, module.szExePath, (void*)module.modBaseAddr));
+            if (map->has_symbols) {
+                map->bss_base = self->map.bss.base;
+                map->bss_size = self->map.bss.size;
+            }
+            log_d("Binary map: %s (symbols %d)", map->path, map->has_symbols);
+            continue;
+        }
+
+        // The first memory map of the shared library (if any)
+        char* needle = strstr(module.szExePath, "python");
+        if (!isvalid(pd->maps[MAP_LIBSYM].path) && isvalid(needle)) {
+            bool has_symbols = success(_py_proc__analyze_pe(self, module.szExePath, (void*)module.modBaseAddr));
+            if (has_symbols) {
+                map       = &(pd->maps[MAP_LIBSYM]);
+                map->path = strdup(module.szExePath);
+                if (!isvalid(map->path)) {
+                    set_error(MALLOC, "Failed to allocate memory for map path");
+                    FAIL;
+                }
+                map->file_size   = module.modBaseSize;
+                map->base        = (void*)module.modBaseAddr;
+                map->size        = module.modBaseSize;
+                map->has_symbols = true;
+                map->bss_base    = self->map.bss.base;
+                map->bss_size    = self->map.bss.size;
+
+                log_d("Library map: %s (with symbols)", map->path);
+
+                continue;
+            }
+
+            // The first memory map of a binary that contains "pythonX.Y" in its name
+            if (!isvalid(pd->maps[MAP_LIBNEEDLE].path)) {
+                if (isvalid(needle)) {
+                    unsigned int v;
+                    if (sscanf(needle, "python%u.%u", &v, &v) == 2) {
+                        map       = &(pd->maps[MAP_LIBNEEDLE]);
+                        map->path = needle_path = strdup(module.szExePath);
+                        if (!isvalid(map->path)) {
+                            set_error(MALLOC, "Failed to allocate memory for map path");
+                            FAIL;
+                        }
+                        map->file_size   = module.modBaseSize;
+                        map->base        = (void*)module.modBaseAddr;
+                        map->size        = module.modBaseSize;
+                        map->has_symbols = false;
+                        log_d("Library map: %s (needle)", map->path);
+                        continue;
+                    }
+                }
+            }
+        }
+    } while (Module32Next(mod_hdl, &module));
+
+    // If the library map is not valid, use the needle map
+    if (!isvalid(pd->maps[MAP_LIBSYM].path)) {
+        pd->maps[MAP_LIBSYM]         = pd->maps[MAP_LIBNEEDLE];
+        pd->maps[MAP_LIBNEEDLE].path = needle_path = NULL;
+    }
+
+    // Work out paths
+    self->bin_path = pd->maps[MAP_BIN].path;
+    self->lib_path = pd->maps[MAP_LIBSYM].path;
+
+    // Work out binary map
+    for (int i = 0; i < MAP_COUNT; i++) {
+        map = &(pd->maps[i]);
+        if (map->has_symbols) {
+            self->map.exe.base = map->base;
+            self->map.exe.size = map->size;
+            break;
+        }
+    }
+
+    // Work out BSS map
+    int map_index      = isvalid(pd->maps[MAP_LIBSYM].path) ? MAP_LIBSYM : MAP_BIN;
+    self->map.bss.base = pd->maps[map_index].bss_base;
+    self->map.bss.size = pd->maps[map_index].bss_size;
+
+    log_d("BSS map %d from %s @ %p", map_index, pd->maps[map_index].path, self->map.bss.base);
+    log_d("VM maps parsing result: bin=%s lib=%s symbols=%d", self->bin_path, self->lib_path, self->sym_loaded);
+
+    if (!self->sym_loaded) {
+        set_error(BINARY, "Cannot find symbols in binary");
+        FAIL;
+    }
+
+    SUCCESS;
 }
-
 
 // ----------------------------------------------------------------------------
-static ssize_t _py_proc__get_resident_memory(py_proc_t * self) {
-  PROCESS_MEMORY_COUNTERS mem_info;
+static ssize_t
+_py_proc__get_resident_memory(py_proc_t* self) {
+    PROCESS_MEMORY_COUNTERS mem_info;
 
-  return GetProcessMemoryInfo(self->extra->h_proc, &mem_info, sizeof(mem_info))
-    ? mem_info.WorkingSetSize
-    : -1;
+    return GetProcessMemoryInfo(self->ref, &mem_info, sizeof(mem_info)) ? mem_info.WorkingSetSize : -1;
 }
 
+// ----------------------------------------------------------------------------
+// The leading part of the (undocumented) RTL_USER_PROCESS_PARAMETERS structure,
+// up to the environment block pointer. The definition in winternl.h is opaque.
+typedef struct {
+    ULONG          MaximumLength;
+    ULONG          Length;
+    ULONG          Flags;
+    ULONG          DebugFlags;
+    HANDLE         ConsoleHandle;
+    ULONG          ConsoleFlags;
+    HANDLE         StandardInput;
+    HANDLE         StandardOutput;
+    HANDLE         StandardError;
+    UNICODE_STRING CurrentDirectoryPath;
+    HANDLE         CurrentDirectoryHandle;
+    UNICODE_STRING DllPath;
+    UNICODE_STRING ImagePathName;
+    UNICODE_STRING CommandLine;
+    PVOID          Environment;
+} process_parameters_t;
 
 // ----------------------------------------------------------------------------
 static int
-_py_proc__init(py_proc_t * self) {
-  if (!isvalid(self))
-    FAIL;
+_py_proc__get_process_parameters(py_proc_t* self, process_parameters_t* params) {
+    PROCESS_BASIC_INFORMATION pbi;
+    ULONG                     n = 0;
 
-  return _py_proc__get_modules(self);
+    if (NtQueryInformationProcess(self->ref, ProcessBasicInformation, &pbi, sizeof(pbi), &n) < 0)
+        FAIL;
+
+    PVOID params_addr = NULL;
+    if (fail(copy_datatype(self->ref, (raddr_t)pbi.PebBaseAddress + offsetof(PEB, ProcessParameters), params_addr)))
+        FAIL;
+
+    if (fail(copy_memory(self->ref, (raddr_t)params_addr, sizeof(process_parameters_t), params)))
+        FAIL;
+
+    SUCCESS;
 }
 
+// ----------------------------------------------------------------------------
+// Convert a wide string of the given length (in characters) to a newly
+// allocated, NUL-terminated UTF-8 string.
+static char*
+_wide_to_utf8(const WCHAR* wide, int wlen, size_t* size) {
+    int len = WideCharToMultiByte(CP_UTF8, 0, wide, wlen, NULL, 0, NULL, NULL);
+    if (len <= 0)
+        return NULL;
+
+    char* utf8 = (char*)malloc(len + 1);
+    if (!isvalid(utf8))
+        return NULL;
+
+    WideCharToMultiByte(CP_UTF8, 0, wide, wlen, utf8, len, NULL, NULL);
+    utf8[len] = '\0';
+    if (isvalid(size))
+        *size = len;
+
+    return utf8;
+}
+
+// ----------------------------------------------------------------------------
+// Return the current working directory of the process. The returned string must
+// be freed by the caller.
+static char*
+_py_proc__get_cwd(py_proc_t* self) {
+    process_parameters_t params;
+    if (fail(_py_proc__get_process_parameters(self, &params)))
+        return NULL;
+
+    USHORT wlen = params.CurrentDirectoryPath.Length / sizeof(WCHAR);
+    if (wlen == 0)
+        return NULL;
+
+    cu_void* wide = calloc(wlen, sizeof(WCHAR));
+    if (!isvalid(wide)
+        || fail(copy_memory(
+            self->ref, (raddr_t)params.CurrentDirectoryPath.Buffer, params.CurrentDirectoryPath.Length, wide
+        )))
+        return NULL;
+
+    // The current directory carries a trailing separator, unless it is a
+    // drive root (e.g. C:\), which we strip to match getcwd.
+    if (wlen > 3 && ((WCHAR*)wide)[wlen - 1] == L'\\')
+        wlen--;
+
+    return _wide_to_utf8((WCHAR*)wide, wlen, NULL);
+}
+
+// ----------------------------------------------------------------------------
+// Return the NUL-separated environment block of the process, as UTF-8. The
+// block is always NUL-terminated and must be freed by the caller.
+static char*
+_py_proc__get_environ(py_proc_t* self, size_t* size) {
+    process_parameters_t params;
+    if (fail(_py_proc__get_process_parameters(self, &params)) || !isvalid(params.Environment))
+        return NULL;
+
+    // The environment block has no explicit size, so we read up to the end of
+    // the memory region that contains it, and then look for the terminator.
+    MEMORY_BASIC_INFORMATION mbi;
+    if (VirtualQueryEx(self->ref, params.Environment, &mbi, sizeof(mbi)) == 0)
+        return NULL;
+
+    size_t region_size = (size_t)((char*)mbi.BaseAddress + mbi.RegionSize - (char*)params.Environment);
+    if (region_size > (1 << 20))
+        region_size = 1 << 20;
+
+    cu_void* wide = malloc(region_size);
+    if (!isvalid(wide) || fail(copy_memory(self->ref, (raddr_t)params.Environment, region_size, wide)))
+        return NULL;
+
+    // Find the double NUL that terminates the block.
+    WCHAR* w    = (WCHAR*)wide;
+    size_t wlen = region_size / sizeof(WCHAR);
+    size_t i    = 0;
+    while (i + 1 < wlen && !(w[i] == L'\0' && w[i + 1] == L'\0'))
+        i++;
+
+    return i == 0 ? NULL : _wide_to_utf8(w, (int)i + 1, size);
+}
+
+// ----------------------------------------------------------------------------
+static inline bool
+_py_proc__is_running(py_proc_t* self) {
+    DWORD ec = 0;
+    return GetExitCodeProcess(self->ref, &ec) ? ec == STILL_ACTIVE : false;
+}
+
+// ----------------------------------------------------------------------------
+// Locate the "AsyncioDebug" PE section exposed by the _asyncio extension
+// module. Section names longer than IMAGE_SIZEOF_SHORT_NAME (8 bytes) are
+// truncated by the linker in the final image, so both the section's raw Name
+// field and the search string are compared only up to that length.
+static void
+_py_proc__find_asyncio_debug_section(py_proc_t* self, void* pMapping, void* base) {
+    IMAGE_DOS_HEADER*     dos_hdr = (IMAGE_DOS_HEADER*)pMapping;
+    IMAGE_NT_HEADERS*     nt_hdr  = (IMAGE_NT_HEADERS*)(pMapping + dos_hdr->e_lfanew);
+    IMAGE_SECTION_HEADER* s_hdr   = (IMAGE_SECTION_HEADER*)(pMapping + dos_hdr->e_lfanew + sizeof(IMAGE_NT_HEADERS));
+
+    if (nt_hdr->Signature != IMAGE_NT_SIGNATURE)
+        return;
+
+    for (register int i = 0; i < nt_hdr->FileHeader.NumberOfSections; i++) {
+        if (strncmp((const char*)s_hdr[i].Name, "AsyncioD", IMAGE_SIZEOF_SHORT_NAME) == 0) {
+            self->map.asyncio_debug.base = base + s_hdr[i].VirtualAddress;
+            self->map.asyncio_debug.size = s_hdr[i].Misc.VirtualSize;
+            return;
+        }
+    }
+} // _py_proc__find_asyncio_debug_section
+
+// ----------------------------------------------------------------------------
+// Map one already-located module by path and analyse it for the
+// AsyncioDebug section. Deliberately NOT _py_proc__analyze_pe: that also
+// resolves exports and hard-fails if none are found, which is never true for
+// an extension module like _asyncio.
+static void
+_py_proc__scan_module_for_asyncio(py_proc_t* self, char* path, void* base) {
+    cu_HANDLE hFile = CreateFile(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) {
+        log_d("Cannot open %s", path);
+        return;
+    }
+
+    cu_HANDLE hMapping = CreateFileMapping(hFile, NULL, PAGE_READONLY, 0, 0, 0);
+    if (!isvalid(hMapping)) {
+        log_d("Cannot create file mapping for %s", path);
+        return;
+    }
+
+    cu_VOF pMapping = MapViewOfFile(hMapping, FILE_MAP_READ, 0, 0, 0);
+    if (!isvalid(pMapping)) {
+        log_d("Cannot map %s", path);
+        return;
+    }
+
+    _py_proc__find_asyncio_debug_section(self, pMapping, base);
+} // _py_proc__scan_module_for_asyncio
+
+// ----------------------------------------------------------------------------
+// Look for the AsyncioDebug section in the _asyncio module and, if it's
+// built straight into the main executable or the Python library instead
+// (some 3.14+ builds), fall back to those.
+static void
+_py_proc__scan_for_asyncio(py_proc_t* self) {
+    if (isvalid(self->map.asyncio_debug.base))
+        return;
+
+    cu_HANDLE mod_hdl = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, self->pid);
+    if (mod_hdl == INVALID_HANDLE_VALUE)
+        return;
+
+    MODULEENTRY32 module;
+    module.dwSize = sizeof(module);
+
+    if (!Module32First(mod_hdl, &module))
+        return;
+
+    do {
+        bool is_candidate = isvalid(strstr(module.szExePath, "_asyncio"))
+                         || (isvalid(self->bin_path) && strcmp(module.szExePath, self->bin_path) == 0)
+                         || (isvalid(self->lib_path) && strcmp(module.szExePath, self->lib_path) == 0);
+        if (!is_candidate)
+            continue;
+
+        _py_proc__scan_module_for_asyncio(self, module.szExePath, (void*)module.modBaseAddr);
+        if (isvalid(self->map.asyncio_debug.base))
+            return;
+    } while (Module32Next(mod_hdl, &module));
+} // _py_proc__scan_for_asyncio
+
+// ----------------------------------------------------------------------------
+static int
+_py_proc__init(py_proc_t* self) {
+    if (!isvalid(self)) {
+        set_error(NULL, "Invalid process structure");
+        FAIL;
+    }
+
+    if (fail(_py_proc__get_modules(self))) {
+        log_d("Process does not seem to be Python; look for single child process");
+        return _py_proc__try_child_proc(self);
+    }
+
+    SUCCESS;
+}
 
 // ----------------------------------------------------------------------------
 // The default stream buffer size should be 4KB, so this chunk size should be
@@ -202,85 +581,10 @@ _py_proc__init(py_proc_t * self) {
 
 DWORD WINAPI
 reader_thread(LPVOID lpParam) {
-  char buffer[STDOUT_CHUNK_SIZE];
-  while (ReadFile(lpParam, &buffer, STDOUT_CHUNK_SIZE, NULL, NULL));
-  return 0;
-}
-
-
-// ----------------------------------------------------------------------------
-// Forward declaration.
-static int
-_py_proc__run(py_proc_t *);
-
-
-// On Windows, if we fail with the parent process we look if it has a single
-// child and try to attach to that instead. We keep going until we either find
-// a single Python process or more or less than a single child.
-static int
-_py_proc__try_child_proc(py_proc_t * self) {
-  log_d("Process is not Python so we look for a single child Python process");
-
-  HANDLE h = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-  if (h == INVALID_HANDLE_VALUE) {
-    log_e("Cannot inspect processes details");
-    FAIL;
-  }
-
-with_resources;
-
-  HANDLE orig_hproc = self->extra->h_proc;
-  pid_t  orig_pid   = self->pid;
-  while (TRUE) {
-    pid_t parent_pid = self->pid;
-
-    PROCESSENTRY32 pe = { 0 };
-    pe.dwSize = sizeof(PROCESSENTRY32);
-
-    if (Process32First(h, &pe)) {
-      pid_t child_pid = 0;
-      do {
-        if (pe.th32ParentProcessID == parent_pid) {
-          if (child_pid) {
-            log_d("Process has more than one child");
-            NOK;
-          }
-          child_pid = pe.th32ProcessID;
-        }
-      } while (Process32Next(h, &pe));
-
-      if (!child_pid) {
-        log_d("Process has no children");
-        NOK;
-      }
-
-      self->pid = child_pid;
-      self->extra->h_proc = OpenProcess(
-        PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, child_pid
-      );
-      if (self->extra->h_proc == INVALID_HANDLE_VALUE) {
-        log_e("Cannot open child process handle");
-        NOK;
-      }
-      if (success(_py_proc__run(self))) {
-        log_d("Process has a single Python child with PID %d. We will attach to that", child_pid);
-        OK;
-      }
-      else {
-        log_d("Process has a single non-Python child with PID %d. Taking it as new parent", child_pid);
-        CloseHandle(self->extra->h_proc);
-      }
-    }
-  }
-
-release:
-  CloseHandle(h);
-  if (retval) {
-    self->pid = orig_pid;
-    self->extra->h_proc = orig_hproc;
-  }
-  
-  released;
+    char buffer[STDOUT_CHUNK_SIZE];
+    while (ReadFile(lpParam, &buffer, STDOUT_CHUNK_SIZE, NULL, NULL))
+        ;
+    return 0;
 }
 
 #endif

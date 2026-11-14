@@ -3,54 +3,37 @@ on:
   push:
     tags:
       - 'v*-*'
+
+permissions:
+  contents: write
+
 jobs:
   release-linux-archs:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       matrix:
         arch: ["armv7", "aarch64", "ppc64le"]
       fail-fast: false
     name: Build on ${{ matrix.arch }}
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v3
         name: Checkout sources
-      - uses: uraimo/run-on-arch-action@v2.0.5
+      - uses: uraimo/run-on-arch-action@v3
         name: Generate artifacts on ${{ matrix.arch }}
         id: run-tests-on-arch
         with:
           arch: ${{ matrix.arch }}
-          distro: ubuntu20.04
+          distro: ubuntu24.04
           githubToken: ${{ github.token }}
           dockerRunArgs: --volume "${GITHUB_WORKSPACE}/artifacts:/artifacts"
           setup: |
             mkdir -p ./artifacts
 
             # Compute dev version
-            export PREV_VERSION=$(cat src/austin.h | sed -r -n "s/.*VERSION[ ]+\"(.+)\"/\1/p")
+            export PREV_VERSION=$(cat src/austin.h | sed -r -n "s/^#define VERSION[ ]+\"(.+)\"/\1/p")
             export VERSION=${{ github.ref_name }}
             sed -i "s/$PREV_VERSION/$VERSION/g" src/austin.h
-          run: |
-            apt-get update
-            apt-get -y install autoconf build-essential libunwind-dev binutils-dev libiberty-dev musl-tools
-
-            # Build austin
-            autoreconf --install
-            ./configure
-            make
-
-            export VERSION=$(cat src/austin.h | sed -r -n "s/.*VERSION[ ]+\"(.+)\"/\1/p")
-
-            pushd src
-            tar -Jcf austin-$VERSION-gnu-linux-${{ matrix.arch }}.tar.xz austin
-            tar -Jcf austinp-$VERSION-gnu-linux-${{ matrix.arch }}.tar.xz austinp
-
-            musl-gcc -O3 -Os -s -Wall -pthread *.c -o austin -D__MUSL__
-            tar -Jcf austin-$VERSION-musl-linux-${{ matrix.arch }}.tar.xz austin
-
-            mv austin-$VERSION-gnu-linux-${{ matrix.arch }}.tar.xz /artifacts
-            mv austinp-$VERSION-gnu-linux-${{ matrix.arch }}.tar.xz /artifacts
-            mv austin-$VERSION-musl-linux-${{ matrix.arch }}.tar.xz /artifacts
-            popd
+          run: ARCH=${{ matrix.arch }} bash scripts/build_arch.sh
 
       - name: Show artifacts
         run: |

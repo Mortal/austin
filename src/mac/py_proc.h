@@ -22,508 +22,764 @@
 
 #ifdef PY_PROC_C
 
-#include <stddef.h>
-#include <stdio.h>
 #include <libproc.h>
-#include <mach/mach.h>
-#include <mach/mach_vm.h>
 #include <mach-o/fat.h>
 #include <mach-o/loader.h>
 #include <mach-o/nlist.h>
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#include <mach/machine.h>
+#include <stddef.h>
+#include <stdio.h>
 #include <sys/mman.h>
-#include <sys/stat.h>
 #include <sys/param.h>
 #include <sys/proc.h>
+#include <sys/stat.h>
+#include <sys/sysctl.h>
+#include <sys/types.h>
 #include <unistd.h>
 
 #include "../hints.h"
+#include "../mem.h"
+#include "../resources.h"
 
-#define CHECK_HEAP
-#define DEREF_SYM
-
-
-#define SYMBOLS                        2
-
-#define PROC_REF                        (self->extra->task_id)
-
-
-#define next_lc(cmd)    (cmd = (struct segment_command *)    ((void *) cmd + cmd->cmdsize));
-#define next_lc_64(cmd) (cmd = (struct segment_command_64 *) ((void *) cmd + cmd->cmdsize));
+#define next_lc(cmd)    (cmd = (struct segment_command*)((void*)cmd + cmd->cmdsize));
+#define next_lc_64(cmd) (cmd = (struct segment_command_64*)((void*)cmd + cmd->cmdsize));
 
 // ---- Endianness ----
 #define ENDIAN(f, v) (f ? __bswap_32(v) : v)
 
-#define bswap_16(value) \
-((((value) & 0xff) << 8) | ((value) >> 8))
+#define bswap_16(value) ((((value) & 0xff) << 8) | ((value) >> 8))
 
-#define bswap_32(value) \
-(((uint32_t)bswap_16((uint16_t)((value) & 0xffff)) << 16) | \
-(uint32_t)bswap_16((uint16_t)((value) >> 16)))
+#define bswap_32(value)                                                                                        \
+    (((uint32_t)bswap_16((uint16_t)((value) & 0xffff)) << 16) | (uint32_t)bswap_16((uint16_t)((value) >> 16)))
 
 #define sw32(f, v) (f ? bswap_32(v) : v)
 
-
 struct _proc_extra_info {
-  mach_port_t task_id;
+    // Process start time, derived from pbi_start_tvsec/pbi_start_tvusec in
+    // proc_bsdinfo.  Captured on the first liveness check and compared on
+    // subsequent ones to detect PID reuse; a different value means a new
+    // process now owns the PID and our target is gone.
+    uint64_t starttime;
 };
-
 
 // ----------------------------------------------------------------------------
 // NOTE: This is inspired by glibc/posix/execvpe.c
-extern char **environ;
+extern char** environ;
 
 static void
-_maybe_script_execute(const char * file, char * const argv[]) {
-  ptrdiff_t argc = 0;
-  for (ptrdiff_t argc = 0; argv[argc] != NULL; argc++);
+_maybe_script_execute(const char* file, char* const argv[]) {
+    ptrdiff_t argc = 0;
+    for (ptrdiff_t argc = 0; argv[argc] != NULL; argc++)
+        ;
 
-  char *new_argv[argc > 1 ? 2 + argc : 3];
-  new_argv[0] = (char *) "/bin/sh";
-  new_argv[1] = (char *) file;
-  if (argc > 1)
-    memcpy (new_argv + 2, argv + 1, argc * sizeof (char *));
-  else
-    new_argv[2] = NULL;
-  /* Execute the shell.  */
-  execve(new_argv[0], new_argv, environ);
+    char* new_argv[argc > 1 ? 2 + argc : 3];
+    new_argv[0] = (char*)"/bin/sh";
+    new_argv[1] = (char*)file;
+    if (argc > 1)
+        memcpy(new_argv + 2, argv + 1, argc * sizeof(char*));
+    else
+        new_argv[2] = NULL;
+    /* Execute the shell.  */
+    execve(new_argv[0], new_argv, environ);
 }
 
-
-#define execvpe(file, argv, environ) { \
-  execvp(file, argv);                  \
-  _maybe_script_execute(file, argv);   \
-}
-
+#define execvpe(file, argv, environ)       \
+    {                                      \
+        execvp(file, argv);                \
+        _maybe_script_execute(file, argv); \
+    }
 
 // ----------------------------------------------------------------------------
 static bin_attr_t
-_py_proc__analyze_macho64(py_proc_t * self, void * base, void * map) {
-  bin_attr_t bin_attrs = 0;
+_py_proc__analyze_macho64(py_proc_t* self, void* base, void* map) {
+    bin_attr_t bin_attrs = 0;
+    int64_t    offset    = 0;
 
-  struct mach_header_64 * hdr = (struct mach_header_64 *) map;
+    struct mach_header_64* hdr = (struct mach_header_64*)map;
 
-  switch(hdr->filetype) {
-  case MH_EXECUTE:
-    bin_attrs |= BT_EXEC;
-    break;
-  case MH_DYLIB:
-    bin_attrs |= BT_LIB;
-    break;
-  default:
-    return 0;
-  }
+    switch (hdr->filetype) {
+    case MH_EXECUTE:
+        bin_attrs |= BT_EXEC;
+        break;
+    case MH_DYLIB:
+    // Python C-extension modules (e.g. _asyncio) are Mach-O bundles, not
+    // dylibs, but still carry the sections we scan for (AsyncioDebug etc).
+    case MH_BUNDLE:
+        bin_attrs |= BT_LIB;
+        break;
+    default:
+        return 0;
+    }
 
-  int ncmds = hdr->ncmds;
-  int s     = (hdr->magic == MH_CIGAM_64);
+    int ncmds = hdr->ncmds;
+    int s     = (hdr->magic == MH_CIGAM_64);
 
-  int                         cmd_cnt  = 0;
-  struct segment_command_64 * cmd      = map + sizeof(struct mach_header_64);
+    int                        cmd_cnt = 0;
+    struct segment_command_64* cmd     = map + sizeof(struct mach_header_64);
 
-  for (register int i = 0; cmd_cnt < 2 && i < ncmds; i++) {
-    switch (cmd->cmd) {
-    case LC_SEGMENT_64:
-      if (strcmp(cmd->segname, "__TEXT") == 0) {
-        // NOTE: This is based on the assumption that we find this segment
-        // early enough to allow later computations to use the correct value.
-        base -= cmd->vmaddr;
-      }
-      else if (strcmp(cmd->segname, "__DATA") == 0) {
-        int nsects = cmd->nsects;
-        struct section_64 * sec = (struct section_64 *) ((void *) cmd + sizeof(struct segment_command_64));
-        self->map.bss.size = 0;
-        for (register int j = 0; j < nsects; j++) {
-          if (strcmp(sec[j].sectname, "__bss") == 0) {
-            self->map.bss.base = base + sec[j].addr;
-            self->map.bss.size = sec[j].size;
-            bin_attrs |= B_BSS;
+    for (register int i = 0; cmd_cnt < 2 && i < ncmds; i++) {
+        switch (cmd->cmd) {
+        case LC_SEGMENT_64:
+            if (strcmp(cmd->segname, "__TEXT") == 0) {
+                offset = (int64_t)base - cmd->vmaddr;
+            } else if (strcmp(cmd->segname, "__DATA") == 0) {
+                int                nsects = cmd->nsects;
+                struct section_64* sec    = (struct section_64*)((void*)cmd + sizeof(struct segment_command_64));
+                self->map.bss.size        = 0;
+                for (register int j = 0; j < nsects; j++) {
+                    if (strcmp(sec[j].sectname, "__bss") == 0) {
+                        self->map.bss.base  = (void*)(offset + sec[j].addr);
+                        self->map.bss.size  = sec[j].size;
+                        bin_attrs          |= B_BSS;
+                        continue;
+                    }
+                    // This section was added in Python 3.11
+                    if (strcmp(sec[j].sectname, "PyRuntime") == 0) {
+                        self->map.runtime.base = (void*)(offset + sec[j].addr);
+                        self->map.runtime.size = sec[j].size;
+                        continue;
+                    }
+                    // Exposed by the _asyncio extension module since Python 3.14.
+                    if (strcmp(sec[j].sectname, "AsyncioDebug") == 0) {
+                        self->map.asyncio_debug.base = (void*)(offset + sec[j].addr);
+                        self->map.asyncio_debug.size = sec[j].size;
+                        continue;
+                    }
+                }
+                cmd_cnt++;
+            }
             break;
-          }
-        }
-        cmd_cnt++;
-      }
-      break;
 
-    case LC_SYMTAB:
-      for (
-        register int i = 0;
-        self->sym_loaded < SYMBOLS && i < sw32(s, ((struct symtab_command *) cmd)->nsyms);
-        i++
-      ) {
-        struct nlist_64 * sym_tab = (struct nlist_64 *) (map + sw32(s, ((struct symtab_command *) cmd)->symoff));
-        void            * str_tab = (void *)            (map + sw32(s, ((struct symtab_command *) cmd)->stroff));
+        case LC_SYMTAB:
+            for (register int i = 0;
+                 self->sym_loaded < DYNSYM_COUNT && i < sw32(s, ((struct symtab_command*)cmd)->nsyms); i++) {
+                struct nlist_64* sym_tab = (struct nlist_64*)(map + sw32(s, ((struct symtab_command*)cmd)->symoff));
+                void*            str_tab = (void*)(map + sw32(s, ((struct symtab_command*)cmd)->stroff));
 
-        // TODO: Assess quality
-        if ((sym_tab[i].n_type & N_EXT) == 0)
-          continue;
+                if ((sym_tab[i].n_type & N_EXT) == 0)
+                    continue;
 
-        char * sym_name = (char *) (str_tab + sym_tab[i].n_un.n_strx);
-        self->sym_loaded += _py_proc__check_sym(self, sym_name, (void *) (base + sym_tab[i].n_value));
-      }
-      cmd_cnt++;
-    } // switch
+                // Skip undefined (imported) symbols. Extension modules commonly
+                // reference _PyRuntime etc. as undefined externals resolved by
+                // the dynamic linker, with n_value == 0; matching those would
+                // wrongly resolve the symbol to the extension's own load base.
+                if ((sym_tab[i].n_type & N_TYPE) == N_UNDF)
+                    continue;
 
-    next_lc_64(cmd);
-  }
+                char* sym_name = (char*)(str_tab + sym_tab[i].n_un.n_strx);
+                if (_py_proc__check_sym(self, sym_name, (void*)(offset + sym_tab[i].n_value))) {
+                    self->sym_loaded++;
+                }
+            }
+            cmd_cnt++;
+        } // switch
 
-  if (self->sym_loaded > 0)
-    bin_attrs |= B_SYMBOLS;
+        next_lc_64(cmd);
+    }
 
-  return bin_attrs;
+    if (self->sym_loaded > 0)
+        bin_attrs |= B_SYMBOLS;
+
+    return bin_attrs;
 } // _py_proc__analyze_macho64
 
-
 // ----------------------------------------------------------------------------
 static bin_attr_t
-_py_proc__analyze_macho32(py_proc_t * self, void * base, void * map) {
-  bin_attr_t bin_attrs = 0;
+_py_proc__analyze_macho32(py_proc_t* self, void* base, void* map) {
+    bin_attr_t bin_attrs = 0;
+    int64_t    offset    = 0;
 
-  struct mach_header * hdr = (struct mach_header *) map;
+    struct mach_header* hdr = (struct mach_header*)map;
 
-  switch(hdr->filetype) {
-  case MH_EXECUTE:
-    bin_attrs |= BT_EXEC;
-    break;
-  case MH_DYLIB:
-    bin_attrs |= BT_LIB;
-    break;
-  default:
-    return 0;
-  }
+    switch (hdr->filetype) {
+    case MH_EXECUTE:
+        bin_attrs |= BT_EXEC;
+        break;
+    case MH_DYLIB:
+    // Python C-extension modules (e.g. _asyncio) are Mach-O bundles, not
+    // dylibs, but still carry the sections we scan for (AsyncioDebug etc).
+    case MH_BUNDLE:
+        bin_attrs |= BT_LIB;
+        break;
+    default:
+        return 0;
+    }
 
-  int ncmds = hdr->ncmds;
-  int s     = (hdr->magic == MH_CIGAM);
+    int ncmds = hdr->ncmds;
+    int s     = (hdr->magic == MH_CIGAM);
 
-  int                      cmd_cnt  = 0;
-  struct segment_command * cmd      = map + sizeof(struct mach_header);
+    int                     cmd_cnt = 0;
+    struct segment_command* cmd     = map + sizeof(struct mach_header);
 
-  for (register int i = 0; cmd_cnt < 2 && i < ncmds; i++) {
-    switch (cmd->cmd) {
-    case LC_SEGMENT:
-      if (strcmp(cmd->segname, "__TEXT") == 0) {
-        // NOTE: This is based on the assumption that we find this segment
-        // early enough to allow later computations to use the correct value.
-        base -= cmd->vmaddr;
-      }
-      else if (strcmp(cmd->segname, "__DATA") == 0) {
-        int nsects = cmd->nsects;
-        struct section * sec = (struct section *) ((void *) cmd + sizeof(struct segment_command));
-        self->map.bss.size = 0;
-        for (register int j = 0; j < nsects; j++) {
-          if (strcmp(sec[j].sectname, "__bss") == 0) {
-            self->map.bss.base = base + sec[j].addr;
-            self->map.bss.size = sec[j].size;
-            bin_attrs |= B_BSS;
+    for (register int i = 0; cmd_cnt < 2 && i < ncmds; i++) {
+        switch (cmd->cmd) {
+        case LC_SEGMENT:
+            if (strcmp(cmd->segname, "__TEXT") == 0) {
+                offset = (int64_t)base - cmd->vmaddr;
+            } else if (strcmp(cmd->segname, "__DATA") == 0) {
+                int             nsects = cmd->nsects;
+                struct section* sec    = (struct section*)((void*)cmd + sizeof(struct segment_command));
+                self->map.bss.size     = 0;
+                for (register int j = 0; j < nsects; j++) {
+                    if (strcmp(sec[j].sectname, "__bss") == 0) {
+                        self->map.bss.base  = (void*)(offset + sec[j].addr);
+                        self->map.bss.size  = sec[j].size;
+                        bin_attrs          |= B_BSS;
+                        continue;
+                    }
+                    // This section was added in Python 3.11
+                    if (strcmp(sec[j].sectname, "PyRuntime") == 0) {
+                        self->map.runtime.base = (void*)(offset + sec[j].addr);
+                        self->map.runtime.size = sec[j].size;
+                        continue;
+                    }
+                    // Exposed by the _asyncio extension module since Python 3.14.
+                    if (strcmp(sec[j].sectname, "AsyncioDebug") == 0) {
+                        self->map.asyncio_debug.base = (void*)(offset + sec[j].addr);
+                        self->map.asyncio_debug.size = sec[j].size;
+                        continue;
+                    }
+                }
+                cmd_cnt++;
+            }
             break;
-          }
-        }
-        cmd_cnt++;
-      }
-      break;
 
-    case LC_SYMTAB:
-      for (
-        register int i = 0;
-        self->sym_loaded < SYMBOLS && i < sw32(s, ((struct symtab_command *) cmd)->nsyms);
-        i++
-      ) {
-        struct nlist * sym_tab = (struct nlist *) (map + sw32(s, ((struct symtab_command *) cmd)->symoff));
-        void         * str_tab = (void *)         (map + sw32(s, ((struct symtab_command *) cmd)->stroff));
+        case LC_SYMTAB:
+            for (register int i = 0;
+                 self->sym_loaded < DYNSYM_COUNT && i < sw32(s, ((struct symtab_command*)cmd)->nsyms); i++) {
+                struct nlist* sym_tab = (struct nlist*)(map + sw32(s, ((struct symtab_command*)cmd)->symoff));
+                void*         str_tab = (void*)(map + sw32(s, ((struct symtab_command*)cmd)->stroff));
 
-        // TODO: Assess quality
-        if ((sym_tab[i].n_type & N_EXT) == 0)
-          continue;
+                if ((sym_tab[i].n_type & N_EXT) == 0)
+                    continue;
 
-        char * sym_name = (char *) (str_tab + sym_tab[i].n_un.n_strx);
-        self->sym_loaded += _py_proc__check_sym(self, sym_name, (void *) (base + sym_tab[i].n_value));
-      }
-      cmd_cnt++;
-    } // switch
+                // Skip undefined (imported) symbols. Extension modules commonly
+                // reference _PyRuntime etc. as undefined externals resolved by
+                // the dynamic linker, with n_value == 0; matching those would
+                // wrongly resolve the symbol to the extension's own load base.
+                if ((sym_tab[i].n_type & N_TYPE) == N_UNDF)
+                    continue;
 
-    next_lc(cmd);
-  }
+                char* sym_name = (char*)(str_tab + sym_tab[i].n_un.n_strx);
+                if (_py_proc__check_sym(self, sym_name, (void*)(offset + sym_tab[i].n_value))) {
+                    self->sym_loaded++;
+                }
+            }
+            cmd_cnt++;
+        } // switch
 
-  if (self->sym_loaded > 0)
-    bin_attrs |= B_SYMBOLS;
+        next_lc(cmd);
+    }
 
-  return bin_attrs;
+    if (self->sym_loaded)
+        bin_attrs |= B_SYMBOLS;
+
+    return bin_attrs;
 } // _py_proc__analyze_macho32
 
-
 // ----------------------------------------------------------------------------
 static bin_attr_t
-_py_proc__analyze_fat(py_proc_t * self, void * base, void * map) {
-  log_t("Analyze fat binary");
-  bin_attr_t bin_attrs = 0;
+_py_proc__analyze_fat(py_proc_t* self, void* base, void* map) {
+    cpu_type_t cpu;
+    int        is_abi64;
+    size_t     cpu_size = sizeof(cpu), abi64_size = sizeof(is_abi64);
 
-  void * vm_map = malloc(sizeof(struct mach_header_64));
-  if (!isvalid(vm_map))
-    FAIL;
+    sysctlbyname("hw.cputype", &cpu, &cpu_size, NULL, 0);
+    sysctlbyname("hw.cpu64bit_capable", &is_abi64, &abi64_size, NULL, 0);
 
-  if (success(copy_memory(self->pid, base, sizeof(struct mach_header_64), vm_map))) {
-    // Determine CPU type from process in memory
-    struct mach_header_64 * hdr = (struct mach_header_64 *) vm_map;
-    int ms = hdr->magic == MH_CIGAM || hdr->magic == MH_CIGAM_64;  // This is probably useless
-    cpu_type_t cpu = hdr->cputype;
+    cpu |= is_abi64 * CPU_ARCH_ABI64;
 
     // Look up corresponding part from universal binary
-    struct fat_header * fat_hdr = (struct fat_header *) map;
+    struct fat_header* fat_hdr = (struct fat_header*)map;
 
-    int fs = fat_hdr->magic == FAT_CIGAM;
-    struct fat_arch * arch = (struct fat_arch *) (map + sizeof(struct fat_header));
+    int              fs   = fat_hdr->magic == FAT_CIGAM;
+    struct fat_arch* arch = (struct fat_arch*)(map + sizeof(struct fat_header));
 
     uint32_t narchs = sw32(fs, fat_hdr->nfat_arch);
+    log_d("Found %d architectures in fat binary", narchs);
+
     for (register int i = 0; i < narchs; i++) {
-      if (sw32(fs, arch[i].cputype) == sw32(ms, cpu)) {
-        hdr = (struct mach_header_64 *) (map + sw32(fs, arch[i].offset));
-        switch (hdr->magic) {
-        case MH_MAGIC:
-        case MH_CIGAM:
-          bin_attrs = _py_proc__analyze_macho32(self, base, (void *) hdr);
-          break;
+        log_d("- architecture %x (expected %x)", sw32(fs, arch[i].cputype), cpu);
 
-        case MH_MAGIC_64:
-        case MH_CIGAM_64:
-          bin_attrs = _py_proc__analyze_macho64(self, base, (void *) hdr);
-          break;
+        if (sw32(fs, arch[i].cputype) == cpu) {
+            struct mach_header_64* hdr = (struct mach_header_64*)(map + sw32(fs, arch[i].offset));
+
+            switch (hdr->magic) {
+            case MH_MAGIC:
+            case MH_CIGAM:
+                log_d("Using the 32-bit image of the fat binary");
+                return _py_proc__analyze_macho32(self, base, (void*)hdr);
+
+            case MH_MAGIC_64:
+            case MH_CIGAM_64:
+                log_d("Using the 64-bit image of the fat binary");
+                return _py_proc__analyze_macho64(self, base, (void*)hdr);
+
+            default:
+                log_e("Unexpected Mach-O magic");
+                return INVALID_ATTR;
+            }
+
+            break;
         }
-        break;
-      }
     }
-  }
-  else log_e("Unable to copy memory from universal binary\n");
 
-  free(vm_map);
+    log_e("Fat binary has no matching architectures");
 
-  return bin_attrs;
+    return INVALID_ATTR;
 }
-
 
 // ----------------------------------------------------------------------------
 static bin_attr_t
-_py_proc__analyze_macho(py_proc_t * self, char * path, void * base, mach_vm_size_t size) {
-  bin_attr_t bin_attrs = 0;
+_py_proc__analyze_macho(py_proc_t* self, char* path, void* base, mach_vm_size_t size) {
+    cu_fd fd = open(path, O_RDONLY);
+    if (fd == -1) {
+        log_e("Cannot open binary %s", path);
+        return INVALID_ATTR;
+    }
 
-  int fd = open(path, O_RDONLY);
-  if (fd == -1) {
-    log_e("Cannot open binary %s", path);
+    log_d("Analysing binary %s with base %p", path, base);
+
+    // This would cause problem if allocated in the stack frame
+    cu_void*     fs_buffer = malloc(sizeof(struct stat));
+    struct stat* fs        = (struct stat*)fs_buffer;
+    cu_map_t*    map       = NULL;
+    if (fstat(fd, fs) == -1) { // Get file size
+        set_error(IO, "Cannot determine size of binary file");
+        FAIL; // cppcheck-suppress [memleak]
+    }
+
+    map = map_new(fd, fs->st_size, MAP_SHARED);
+    if (!isvalid(map)) {
+        FAIL; // cppcheck-suppress [memleak]
+    }
+
+    void* map_addr = map->addr;
+    log_t("Local Mach-O file mapping %p-%p\n", map_addr, map_addr + size);
+
+    struct mach_header_64* hdr = (struct mach_header_64*)map_addr;
+    switch (hdr->magic) {
+    case MH_MAGIC:
+    case MH_CIGAM:
+        log_d("Binary is Mach-O 32");
+        return _py_proc__analyze_macho32(self, base, map_addr);
+
+    case MH_MAGIC_64:
+    case MH_CIGAM_64:
+        log_d("Binary is Mach-O 64");
+        return _py_proc__analyze_macho64(self, base, map_addr);
+
+    case FAT_MAGIC:
+    case FAT_CIGAM:
+        log_d("Binary is fat");
+        return _py_proc__analyze_fat(self, base, map_addr);
+
+    default:
+        self->sym_loaded = false;
+    }
+
     return 0;
-  }
-
-  with_resources;
-
-  // This would cause problem if allocated in the stack frame
-  struct stat * fs  = (struct stat *) malloc(sizeof(struct stat));
-  void        * map = MAP_FAILED;
-  if (fstat(fd, fs) == -1) {  // Get file size
-    log_e("Cannot get size of binary %s", path);
-    NOK;
-  }
-
-  map = mmap(NULL, fs->st_size, PROT_READ, MAP_SHARED, fd, 0);
-  if (map == MAP_FAILED) {
-    log_e("Cannot map binary %s", path);
-    NOK;
-  }
-
-  log_t("Local Mach-O file mapping %p-%p\n", map, map+size);
-
-  struct mach_header_64 * hdr = (struct mach_header_64 *) map;
-  switch (hdr->magic) {
-  case MH_MAGIC:
-  case MH_CIGAM:
-    bin_attrs = _py_proc__analyze_macho32(self, base, map);
-    break;
-
-  case MH_MAGIC_64:
-  case MH_CIGAM_64:
-    bin_attrs = _py_proc__analyze_macho64(self, base, map);
-    break;
-
-  case FAT_MAGIC:
-  case FAT_CIGAM:
-    bin_attrs = _py_proc__analyze_fat(self, base, map);
-    break;
-
-  default:
-    self->sym_loaded = 0;
-  }
-
-release:
-  if (map != MAP_FAILED) munmap(map, fs->st_size);
-  sfree(fs);
-  close(fd);
-
-  retval = bin_attrs;
-
-  released;
 } // _py_proc__analyze_macho
 
+// pbi_status sentinel for "status could not be determined" -- not one of the
+// real process states from <sys/proc.h> (SIDL/SRUN/SSLEEP/SSTOP/SZOMB, all
+// small values), so this can never legitimately match a live process.
+#define PROC_STATUS_UNKNOWN 32767
 
 // ----------------------------------------------------------------------------
 static int
 check_pid(pid_t pid) {
-  // The best way of checking would probably be with a call to proc_find, but
-  // this seems to require the Kernel framework.
-  struct proc_bsdinfo proc;
-  proc.pbi_status = SIDL;
+    // The best way of checking would probably be with a call to proc_find, but
+    // this seems to require the Kernel framework.
+    struct proc_bsdinfo proc;
+    proc.pbi_status = SIDL;
 
-  if (proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &proc, PROC_PIDTBSDINFO_SIZE) == -1) {
-    set_error(EPROCNPID);
-    FAIL;
-  }
+    if (proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &proc, PROC_PIDTBSDINFO_SIZE) == -1) {
+        set_error(OS, "Cannot retrieve process information");
+        FAIL;
+    }
 
-  log_t("check_pid :: %d", proc.pbi_status);
+    log_t("check_pid :: %d", proc.pbi_status);
 
-  if (proc.pbi_status == SIDL || proc.pbi_status == 32767) {
-    set_error(EPROCNPID);
-    FAIL;
-  }
+    if (proc.pbi_status == PROC_STATUS_UNKNOWN) {
+        set_error(OS, "Process has unexpected status");
+        FAIL;
+    }
 
-  SUCCESS;
+    SUCCESS;
 }
 
+// ----------------------------------------------------------------------------
+// Liveness check with zombie and PID-reuse detection.  check_pid() accepts
+// SZOMB (zombie) as alive, which would otherwise keep the py_proc__init retry
+// loop spinning for its full timeout after the target exits.  proc_pidinfo
+// also gives us pbi_start_tvsec/pbi_start_tvusec, which uniquely identify the
+// process across its lifetime; capturing and comparing these detects the case
+// where the original target was reaped and a new process reused the PID.
+static inline bool
+_py_proc__is_running(py_proc_t* self) {
+    struct proc_bsdinfo info;
+    if (proc_pidinfo(self->pid, PROC_PIDTBSDINFO, 0, &info, PROC_PIDTBSDINFO_SIZE) != PROC_PIDTBSDINFO_SIZE)
+        return false;
+
+    // SZOMB: exited, awaiting reap.
+    if (info.pbi_status == SZOMB || info.pbi_status == PROC_STATUS_UNKNOWN)
+        return false;
+
+    uint64_t start = ((uint64_t)info.pbi_start_tvsec * 1000000ull) + info.pbi_start_tvusec;
+    if (self->extra->starttime == 0)
+        self->extra->starttime = start;
+    else if (self->extra->starttime != start)
+        return false; // PID has been reused by a different process
+
+    return true;
+}
 
 // ----------------------------------------------------------------------------
 static mach_port_t
 pid_to_task(pid_t pid) {
-  mach_port_t   task;
-  kern_return_t result;
+    mach_port_t   task;
+    kern_return_t result;
 
-  if (fail(check_pid(pid))) {
-    log_d("No such process: %d", pid);
-    FAIL;
-  }
+    if (fail(check_pid(pid))) {
+        log_d("Process ID %d is not valid", pid);
+        return 0;
+    }
 
-  result = task_for_pid(mach_task_self(), pid, &task);
-  if (result != KERN_SUCCESS) {
-    log_d("Call to task_for_pid failed: %s", mach_error_string(result));
-    set_error(EPROCPERM);
-    FAIL;
-  }
-  return task;
+    result = task_for_pid(mach_task_self(), pid, &task);
+    if (result != KERN_SUCCESS) {
+        set_error(PERM, "Cannot obtain task for PID");
+        log_location();
+        return 0;
+    }
+    return task;
 }
-
 
 // ----------------------------------------------------------------------------
 static int
-_py_proc__get_maps(py_proc_t * self) {
-  mach_vm_address_t              address = 0;
-  mach_vm_size_t                 size = 0;
-  vm_region_basic_info_data_64_t region_info;
-  mach_msg_type_number_t         count = sizeof(vm_region_basic_info_data_64_t);
-  mach_port_t                    object_name;
+_py_proc__get_maps(py_proc_t* self) {
+    mach_vm_address_t              address = 0;
+    mach_vm_size_t                 size    = 0;
+    mach_msg_type_number_t         count   = sizeof(vm_region_basic_info_data_64_t);
+    vm_region_basic_info_data_64_t region_info;
+    mach_port_t                    object_name;
 
-  char * path = (char *) calloc(MAXPATHLEN + 1, sizeof(char));
-  if (!isvalid(path))
-    FAIL;
+    // NOTE: Mac OS X kernel bug. This also gives time to the VM maps to
+    // stabilise.
+    usleep(50000); // 50ms
 
-  with_resources;
-
-  // NOTE: Mac OS X kernel bug. This also gives time to the VM maps to
-  // stabilise.
-  usleep(50000);
-
-  self->extra->task_id = pid_to_task(self->pid);
-  if (self->extra->task_id == 0)
-    NOK;
-
-  self->min_raddr = (void *) -1;
-  self->max_raddr = NULL;
-
-  sfree(self->bin_path);
-  self->bin_path = NULL;
-
-  sfree(self->lib_path);
-  self->lib_path = NULL;
-
-  while (mach_vm_region(
-    self->extra->task_id,
-    &address,
-    &size,
-    VM_REGION_BASIC_INFO_64,
-    (vm_region_info_t) &region_info,
-    &count,
-    &object_name
-  ) == KERN_SUCCESS) {
-    if ((void *) address < self->min_raddr)
-      self->min_raddr = (void *) address;
-
-    if ((void *) address + size > self->max_raddr)
-      self->max_raddr = (void *) address + size;
-
-    int len      = proc_regionfilename(self->pid, address, path, MAXPATHLEN);
-    int path_len = strlen(path);
-
-    if (size > 0 && len && !self->sym_loaded) {
-      path[len] = 0;
-
-      bin_attr_t bin_attrs = _py_proc__analyze_macho(self, path, (void *) address, size);
-      if (bin_attrs & B_SYMBOLS) {
-        if (size < BINARY_MIN_SIZE) {
-          // We found the symbols in the binary but we are probably going to use the wrong base
-          // since the map is too small. So pretend we didin't find them.
-          self->sym_loaded = 0;
-        }
-        else {
-          switch (BINARY_TYPE(bin_attrs)) {
-          case BT_EXEC:
-            if (self->bin_path == NULL) {
-              self->bin_path = strndup(path, path_len);
-              log_d("Candidate binary: %s", self->bin_path);
-            }
-            break;
-          case BT_LIB:
-            if (self->lib_path == NULL && size > BINARY_MIN_SIZE) {
-              self->lib_path = strndup(path, path_len);
-              log_d("Candidate library: %s", self->lib_path);
-            }
-          }
-        }
-      }
+    cu_char* prev_path   = NULL;
+    cu_char* needle_path = NULL;
+    cu_char* path        = (char*)calloc(MAXPATHLEN + 1, sizeof(char));
+    if (!isvalid(path)) {
+        set_error(MALLOC, "Cannot allocate memory for map path");
+        FAIL;
     }
 
-    // Make a best guess for the heap boundary.
-    if (self->map.heap.base == NULL)
-      self->map.heap.base = (void *) address;
-    self->map.heap.size += size;
+    sfree(self->bin_path);
+    sfree(self->lib_path);
 
-    address += size;
-  }
+    cu_void* pd_mem = calloc(1, sizeof(struct proc_desc));
+    if (!isvalid(pd_mem)) {
+        set_error(MALLOC, "Cannot allocate memory for proc_desc");
+        FAIL; // cppcheck-suppress [memleak]
+    }
+    struct proc_desc* pd = pd_mem;
 
-  log_d("BSS bounds  [%p - %p]", self->map.bss.base, self->map.bss.base + self->map.bss.size);
-  log_d("HEAP bounds [%p - %p]", self->map.heap.base, self->map.heap.base + self->map.heap.size);
+    if (proc_pidpath(self->pid, pd->exe_path, sizeof(pd->exe_path)) <= 0) {
+        log_w("Cannot get executable path for process %d: %s", self->pid, strerror(errno));
+    }
+    if (strlen(pd->exe_path) == 0) {
+        set_error(OS, "Invalid process executable path");
+        FAIL; // cppcheck-suppress [memleak]
+    }
+    log_d("Executable path: '%s'", pd->exe_path);
 
-  retval = !self->sym_loaded;
+    self->ref = pid_to_task(self->pid);
+    if (self->ref == 0) {
+        FAIL; // cppcheck-suppress [memleak]
+    }
 
-release:
-  free(path);
+    struct vm_map* map = NULL;
 
-  released;
+    while (mach_vm_region(
+               self->ref, &address, &size, VM_REGION_BASIC_INFO_64,
+               (vm_region_info_t)&region_info, // cppcheck-suppress [uninitvar]
+               &count, &object_name
+           )
+           == KERN_SUCCESS) {
+        int path_len = proc_regionfilename(self->pid, address, path, MAXPATHLEN);
+
+        // We assume that the first segment is the executable part. Under this
+        // assumption, the address of this map will be the base address.
+        if (!(region_info.protection & VM_PROT_EXECUTE)) {
+            address += size;
+            continue;
+        }
+
+        if (isvalid(prev_path) && strcmp(path, prev_path) == 0) { // Avoid analysing a binary multiple times
+            goto next;
+        }
+
+        sfree(prev_path);
+        prev_path = strndup(path, path_len);
+        if (!isvalid(prev_path)) {
+            set_error(MALLOC, "Cannot duplicate path name");
+            FAIL;
+        }
+
+        // The first memory map of the shared library (if any)
+        char* needle = strstr(path, "ython");
+
+        // The first memory map of the executable
+        if (!isvalid(pd->maps[MAP_BIN].path) && strcmp(pd->exe_path, path) == 0) {
+            map       = &(pd->maps[MAP_BIN]);
+            map->path = strndup(path, strlen(path));
+            if (!isvalid(map->path)) {
+                set_error(MALLOC, "Cannot duplicate executable path name");
+                FAIL;
+            }
+
+            bin_attr_t bin_attrs = _py_proc__analyze_macho(self, path, (void*)address, size);
+
+            map->file_size   = size;
+            map->base        = (void*)address;
+            map->size        = size;
+            map->has_symbols = !!(bin_attrs & B_SYMBOLS);
+            if (map->has_symbols && bin_attrs & B_BSS) {
+                map->bss_base = self->map.bss.base;
+                map->bss_size = self->map.bss.size;
+            }
+
+            log_d("Binary map: %s (symbols %d)", map->path, map->has_symbols);
+        }
+
+        else if (!isvalid(pd->maps[MAP_LIBSYM].path) && isvalid(needle)) {
+            bin_attr_t bin_attrs = _py_proc__analyze_macho(self, path, (void*)address, size);
+            if (bin_attrs & B_SYMBOLS) {
+                map       = &(pd->maps[MAP_LIBSYM]);
+                map->path = strndup(path, strlen(path));
+                if (!isvalid(map->path)) {
+                    set_error(MALLOC, "Cannot duplicate library path name");
+                    FAIL;
+                }
+                map->file_size   = size;
+                map->base        = (void*)address;
+                map->size        = size;
+                map->has_symbols = true;
+                map->bss_base    = self->map.bss.base;
+                map->bss_size    = self->map.bss.size;
+
+                log_d("Library map: %s (with symbols)", map->path);
+            }
+
+            // The first memory map of a binary that contains "ythonX.Y" or "ython"
+            // and "/X.Y"in its name.
+            else if (!isvalid(pd->maps[MAP_LIBNEEDLE].path)) {
+                if (isvalid(needle)) {
+                    unsigned int v;
+                    if (sscanf(needle, "ython%u.%u", &v, &v) == 2
+                        || (isvalid(strstr(path, "/3.")) && sscanf(strstr(path, "/3."), "/3.%u", &v) == 1)
+                        || (isvalid(strstr(path, "/2.")) && sscanf(strstr(path, "/2."), "/2.%u", &v) == 1)) {
+                        map       = &(pd->maps[MAP_LIBNEEDLE]);
+                        map->path = needle_path = strndup(path, strlen(path));
+                        if (!isvalid(map->path)) {
+                            set_error(MALLOC, "Cannot duplicate library (needle) path name");
+                            FAIL;
+                        }
+                        map->file_size   = size;
+                        map->base        = (void*)address;
+                        map->size        = size;
+                        map->has_symbols = false;
+                        log_d("Library map: %s (needle)", map->path);
+                    }
+                }
+            }
+        }
+
+    next:
+        address += size;
+    }
+
+    log_d("BSS bounds  [%p - %p]", self->map.bss.base, self->map.bss.base + self->map.bss.size);
+
+    // If the library map is not valid, use the needle map
+    if (!isvalid(pd->maps[MAP_LIBSYM].path)) {
+        pd->maps[MAP_LIBSYM]         = pd->maps[MAP_LIBNEEDLE];
+        pd->maps[MAP_LIBNEEDLE].path = needle_path = NULL;
+    }
+
+    // Work out paths
+    self->bin_path = pd->maps[MAP_BIN].path;
+    self->lib_path = pd->maps[MAP_LIBSYM].path;
+
+    // Work out binary map
+    for (int i = 0; i < MAP_COUNT; i++) {
+        map = &(pd->maps[i]);
+        if (map->has_symbols) {
+            self->map.exe.base = map->base;
+            self->map.exe.size = map->size;
+            self->sym_loaded   = true;
+            break;
+        }
+    }
+
+    // Work out BSS map
+    int map_index      = isvalid(pd->maps[MAP_LIBSYM].path) ? MAP_LIBSYM : MAP_BIN;
+    self->map.bss.base = pd->maps[map_index].bss_base;
+    self->map.bss.size = pd->maps[map_index].bss_size;
+
+    if (!self->sym_loaded) {
+        set_error(BINARY, "Cannot detect symbols in library");
+        FAIL;
+    }
+
+    SUCCESS;
 } // _py_proc__get_maps
 
+// ----------------------------------------------------------------------------
+// Look for a mapped image belonging to the _asyncio extension module and, if
+// found, analyse it for the AsyncioDebug section. Unlike the main binary and
+// libpython, _asyncio is loaded lazily on `import asyncio`, so this is called
+// on a throttled retry rather than once at attach time.
+static void
+_py_proc__scan_for_asyncio(py_proc_t* self) {
+    if (isvalid(self->map.asyncio_debug.base))
+        return;
+
+    mach_vm_address_t              address     = 0;
+    mach_vm_size_t                 size        = 0;
+    mach_msg_type_number_t         count       = sizeof(vm_region_basic_info_data_64_t);
+    vm_region_basic_info_data_64_t region_info = {0};
+    mach_port_t                    object_name;
+
+    char* path = (char*)calloc(MAXPATHLEN + 1, sizeof(char));
+    if (!isvalid(path))
+        return;
+
+    while (mach_vm_region(
+               self->ref, &address, &size, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&region_info, &count,
+               &object_name // cppcheck-suppress [uninitvar]
+           )
+           == KERN_SUCCESS) {
+        if (!(region_info.protection & VM_PROT_EXECUTE)) {
+            address += size;
+            continue;
+        }
+
+        int path_len = proc_regionfilename(self->pid, address, path, MAXPATHLEN);
+        if (path_len > 0 && isvalid(strstr(path, "_asyncio"))) {
+            _py_proc__analyze_macho(self, path, (void*)address, size);
+            break; // Only one _asyncio module is expected per process.
+        }
+
+        address += size;
+    }
+
+    free(path);
+} // _py_proc__scan_for_asyncio
 
 // ----------------------------------------------------------------------------
 static ssize_t
-_py_proc__get_resident_memory(py_proc_t * self) {
-  struct mach_task_basic_info info;
-	mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+_py_proc__get_resident_memory(py_proc_t* self) {
+    struct mach_task_basic_info info;
+    mach_msg_type_number_t      count = MACH_TASK_BASIC_INFO_COUNT;
 
-  return task_info(
-    self->extra->task_id, MACH_TASK_BASIC_INFO, (task_info_t) &info, &count
-  ) == KERN_SUCCESS
-    ? info.resident_size
-    : -1;
+    return task_info(
+               self->ref, MACH_TASK_BASIC_INFO, (task_info_t)&info, &count // cppcheck-suppress [uninitvar]
+           ) == KERN_SUCCESS
+             ? info.resident_size
+             : -1;
 } // _py_proc__get_resident_memory
 
+// ----------------------------------------------------------------------------
+// Return the current working directory of the process. The returned string must
+// be freed by the caller.
+static char*
+_py_proc__get_cwd(py_proc_t* self) {
+    struct proc_vnodepathinfo vpi;
+
+    if (proc_pidinfo(self->pid, PROC_PIDVNODEPATHINFO, 0, &vpi, sizeof(vpi)) != sizeof(vpi))
+        return NULL;
+
+    return *vpi.pvi_cdir.vip_path ? strdup(vpi.pvi_cdir.vip_path) : NULL;
+} // _py_proc__get_cwd
+
+// ----------------------------------------------------------------------------
+// Return the NUL-separated environment block of the process, as it was at
+// exec time. The block is always NUL-terminated and must be freed by the caller.
+static char*
+_py_proc__get_environ(py_proc_t* self, size_t* size) {
+    int    mib[3]  = {CTL_KERN, KERN_ARGMAX, 0};
+    int    arg_max = 0;
+    size_t len     = sizeof(arg_max);
+
+    if (sysctl(mib, 2, &arg_max, &len, NULL, 0) != 0 || arg_max <= 0)
+        return NULL;
+
+    cu_char* args = (char*)malloc(arg_max);
+    if (!isvalid(args))
+        return NULL;
+
+    // The KERN_PROCARGS2 buffer has the following layout:
+    //
+    //   int argc | exec_path \0 | \0... | argv[0] \0 ... argv[argc-1] \0 |
+    //   env[0] \0 ... env[n-1] \0 | \0 | apple strings ...
+    mib[1] = KERN_PROCARGS2;
+    mib[2] = self->pid;
+    len    = (size_t)arg_max;
+    if (sysctl(mib, 3, args, &len, NULL, 0) != 0 || len <= sizeof(int))
+        return NULL;
+
+    char* end  = args + len;
+    int   argc = *(int*)args;
+    char* p    = args + sizeof(int);
+
+    // Skip the executable path and the NUL padding that follows it.
+    while (p < end && *p != '\0')
+        p++;
+    while (p < end && *p == '\0')
+        p++;
+
+    // Skip the arguments.
+    for (int i = 0; i < argc && p < end; i++)
+        p += strnlen(p, end - p) + 1;
+
+    if (p >= end)
+        return NULL;
+
+    // The environment ends at the first empty string.
+    char* env = p;
+    while (p < end && *p != '\0')
+        p += strnlen(p, end - p) + 1;
+
+    if (p > end)
+        p = end;
+
+    size_t env_size = p - env;
+    char*  block    = (char*)malloc(env_size + 1);
+    if (!isvalid(block))
+        return NULL;
+
+    memcpy(block, env, env_size);
+    block[env_size] = '\0';
+    *size           = env_size;
+
+    return block;
+} // _py_proc__get_environ
 
 // ----------------------------------------------------------------------------
 static int
-_py_proc__init(py_proc_t * self) {
-  log_t("macOS: py_proc init");
-  if (!isvalid(self))
-    FAIL;
+_py_proc__init(py_proc_t* self) {
+    log_t("macOS: py_proc init");
+    if (!isvalid(self)) {
+        set_error(NULL, "Invalid process structure");
+        FAIL;
+    }
 
-  return _py_proc__get_maps(self);
+    return _py_proc__get_maps(self);
 } // _py_proc__init
 
 #endif
