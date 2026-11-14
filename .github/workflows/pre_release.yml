@@ -3,28 +3,37 @@ on:
   push:
     tags:
       - 'v*-*'
+
+permissions:
+  contents: write
+
 jobs:
   release-linux:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
     name: Release (Linux)
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v3
         name: Checkout Austin
+
+      - name: Setup libunwind
+        uses: ./.github/actions/setup-libunwind
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get -y install binutils-dev libiberty-dev liblzma-dev musl-tools zlib1g-dev libzstd-dev
 
       - name: Generate artifacts
         run: |
-          sudo apt-get update
-          sudo apt-get -y install autoconf build-essential libunwind-dev binutils-dev libiberty-dev musl-tools
-
           # Build austin
           autoreconf --install
           ./configure
           make
 
           # Compute dev version
-          export PREV_VERSION=$(cat src/austin.h | sed -r -n "s/.*VERSION[ ]+\"(.+)\"/\1/p")
+          export PREV_VERSION=$(cat src/austin.h | sed -r -n "s/^#define VERSION[ ]+\"(.+)\"/\1/p")
           export VERSION=${{ github.ref_name }}
           sed -i "s/$PREV_VERSION/$VERSION/g" src/austin.h
 
@@ -56,7 +65,7 @@ jobs:
       fail-fast: false
     name: Release (Windows)
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v3
         name: Checkout Austin
         with:
           fetch-depth: 0
@@ -68,12 +77,12 @@ jobs:
           export PATH="/c/Program Files (x86)/`ls /c/Program\ Files\ \(x86\) | grep \"[wW]i[xX] [tT]oolset\"`/bin:$PATH"
 
           # Compute dev version
-          export PREV_VERSION=$(cat src/austin.h | sed -r -n "s/.*VERSION[ ]+\"(.+)\"/\1/p")
+          export PREV_VERSION=$(cat src/austin.h | sed -r -n "s/^#define VERSION[ ]+\"(.+)\"/\1/p")
           export VERSION_DEV=${{ github.ref_name }}
           export VERSION=$(echo $PREV_VERSION | sed -r -n "s/([0-9]+\.[0-9]+\.[0-9]+).*/\1/p")
           sed -i "s/$PREV_VERSION/$VERSION/g" src/austin.h
 
-          gcc -s -Wall -O3 -Os -o src/austin src/*.c -lpsapi -lntdll
+          gcc -s -Wall -O3 -Os -o src/austin src/*.c -lpsapi -lntdll -ldbghelp
 
           git checkout HEAD -- src/austin.h 
 
@@ -113,18 +122,17 @@ jobs:
       fail-fast: false
     name: Release (macOS)
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v3
         name: Checkout Austin
 
       - name: Generate artifacts
         run: |
           # Compute dev version
-          export PREV_VERSION=$(cat src/austin.h | sed -n -E "s/.*VERSION[ ]+\"(.+)\"/\1/p")
+          export PREV_VERSION=$(cat src/austin.h | sed -n -E "s/^#define VERSION[ ]+\"(.+)\"/\1/p")
           export VERSION=${{ github.ref_name }}
           sed -i "" "s/$PREV_VERSION/$VERSION/g" src/austin.h
-          echo "::set-output name=version::$VERSION"
 
-          gcc -Wall -O3 -Os -o src/austin src/*.c
+          gcc-15 -Wall -O3 -Os -o src/austin src/*.c
 
           pushd src
           zip -r austin-${VERSION}-mac64.zip austin

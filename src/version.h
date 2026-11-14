@@ -26,11 +26,10 @@
 // different versions of the same structures are available, to de-reference
 // structure fields at the correct location.
 
-#ifndef VERSION_H
-#define VERSION_H
-
+#pragma once
 
 #include <stddef.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <sys/types.h>
 
@@ -38,15 +37,10 @@
 #include "platform.h"
 #include "python/abi.h"
 
-
-#define PYVERSION(major, minor, patch)  ((major << 16) | (minor << 8) | patch)
-#define MAJOR(x)                        (x >> 16)
-#define MINOR(x)                        ((x >> 8) & 0xFF)
-#define PATCH(x)                        (x & 0xFF)
-
-#define PYVER_ATMOST(maj, min) \
-  (py_v->major < maj || (py_v->major == maj && py_v->minor <= min))
-
+#define PYVERSION(major, minor, patch) ((major << 16) | (minor << 8) | patch)
+#define MAJOR(x)                       (x >> 16)
+#define MINOR(x)                       ((x >> 8) & 0xFF)
+#define PATCH(x)                       (x & 0xFF)
 
 /**
  * Get the value of a field of a versioned structure.
@@ -65,319 +59,573 @@
  * @return         the value of of the field of py_obj at the offset specified
  *                 by the field argument.
  */
-#define V_FIELD(ctype, py_obj, py_type, field)                                 \
-  (*((ctype*) (((void *) &py_obj) + py_v->py_type.field)))
+#define V_FIELD(ctype, py_obj, py_type, field) (*((ctype*)(((raddr_t) & py_obj) + py_v->py_type.field)))
 
-#define V_FIELD_PTR(ctype, py_obj_ptr, py_type, field)                         \
-  (*((ctype*) (((void *) py_obj_ptr) + py_v->py_type.field)))
+#define V_FIELD_PTR(ctype, py_obj_ptr, py_type, field) (*((ctype*)(((raddr_t)py_obj_ptr) + py_v->py_type.field)))
 
-#define V_DESC(desc) python_v * py_v = (desc)
+#define V_DESC(desc) python_v* py_v = (desc)
 
+/**
+ * Allocate a variable of the given type on the stack, using the size
+ * specified in the versioned Python structure.
+ *
+ * @param type the type of the variable to allocate, e.g. thread for py_thread.
+ * @param var  the name of the variable to allocate.
+ */
+#define V_ALLOCA(type, var) char var[py_v->py_##type.size];
+
+/**
+ * Ensure the current version of Python is at least/at most the request version.
+ *
+ * @param  M  requested major version
+ * @param  m  requested minor version
+ *
+ * @return    true if the current version is at least/at most the requested one,
+ *            false otherwise.
+ */
+#define V_MIN(M, m) (((py_v->major << 8) | py_v->minor) >= ((M << 8) | m))
+#define V_MAX(M, m) (((py_v->major << 8) | py_v->minor) <= ((M << 8) | m))
+#define V_EQ(M, m)  (((py_v->major << 8) | py_v->minor) == ((M << 8) | m))
+
+/**
+ * Convert a raw prev_instr/instr_ptr pointer into a lasti index -- the
+ * offset, in _Py_CODEUNIT units, from the start of the code object's own
+ * bytecode array. Every unwind path that reads prev_instr as a pointer
+ * (rather than an already-usable index) needs this conversion; skipping the
+ * o_code subtraction gives a nonsensical value that silently corrupts
+ * identity comparisons downstream rather than crashing outright, so this is
+ * shared rather than re-derived per call site.
+ *
+ * @param instr_ptr  the raw prev_instr pointer (a code-object-relative
+ *                    raddr_t, NOT a tlbc-relative one -- see the TLBC branch
+ *                    in _py_thread__push_local_iframe, which uses a
+ *                    different base and does not go through this macro).
+ * @param code_raddr the remote address of the code object instr_ptr points
+ *                    into.
+ *
+ * @return the lasti index, as an int.
+ */
+#define V_LASTI(instr_ptr, code_raddr)                                                         \
+    ((int)((((intptr_t)(instr_ptr) - (intptr_t)(code_raddr)) - (intptr_t)py_v->py_code.o_code) \
+           / (intptr_t)sizeof(_Py_CODEUNIT)))
 
 typedef unsigned long offset_t;
 
-
 typedef struct {
-  ssize_t  size;
+    ssize_t size;
 
-  offset_t o_filename;
-  offset_t o_name;
-  offset_t o_lnotab;
-  offset_t o_firstlineno;
+    offset_t o_filename;
+    offset_t o_name;
+    offset_t o_lnotab;
+    offset_t o_firstlineno;
+    offset_t o_code;
+    offset_t o_qualname;
+    offset_t o_tlbc; // offset of co_tlbc in PyCodeObject; 0 when not present (GIL/3.13)
 } py_code_v;
 
-
 typedef struct {
-  ssize_t  size;
+    ssize_t size;
 
-  offset_t o_back;
-  offset_t o_code;
-  offset_t o_lasti;
-  offset_t o_lineno;
+    offset_t o_back;
+    offset_t o_code;
+    offset_t o_lasti;
+    offset_t o_lineno;
 } py_frame_v;
 
+typedef struct {
+    ssize_t size;
+
+    offset_t o_current_frame;
+    offset_t o_previous;
+} py_cframe_v;
 
 typedef struct {
-  ssize_t  size;
+    ssize_t size;
 
-  offset_t o_prev;
-  offset_t o_next;
-  offset_t o_interp;
-  offset_t o_frame;
-  offset_t o_thread_id;
+    offset_t o_code;
+    offset_t o_previous;
+    offset_t o_prev_instr;
+    offset_t o_is_entry;
+    offset_t o_owner;
+    offset_t o_tlbc_index;   // offset of tlbc_index in frame; 0 when not present (GIL/3.13)
+    offset_t o_stackpointer; // top of the frame's own evaluation stack -- used to peek at
+                             // what a suspended coroutine is currently awaiting
+} py_iframe_v;
+
+typedef struct {
+    ssize_t size;
+
+    offset_t o_prev;
+    offset_t o_next;
+    offset_t o_interp;
+    offset_t o_frame;
+    offset_t o_thread_id;
+    offset_t o_native_thread_id;
+    offset_t o_stack;
+    offset_t o_status;
 } py_thread_v;
 
-
 typedef struct {
-  int version;
-} py_unicode_v;
+    ssize_t size;
 
-
-typedef struct {
-  int version;
-} py_bytes_v;
-
-
-typedef struct {
-  ssize_t  size;
-
-  offset_t o_interp_head;
-  offset_t o_gc;
+    offset_t o_interp_head;
+    offset_t o_gc;
 } py_runtime_v;
 
-
 typedef struct {
-  ssize_t  size;
+    ssize_t size;
 
-  offset_t o_next;
-  offset_t o_tstate_head;
-  offset_t o_gc;
+    offset_t o_next;
+    offset_t o_tstate_head;
+    offset_t o_id;
+    offset_t o_gc;
+    offset_t o_imports_modules; // interp->modules (3.10-3.11) or imports_modules (3.13+): IS sys.modules
+    offset_t o_sysdict;         // interp->sysdict (3.12 only): sys.__dict__; reach sys.modules via ["modules"]
+    offset_t o_gil_state;
+    offset_t o_code_object_gen;
+    offset_t o_tlbc_generation;
 } py_is_v;
 
-
 typedef struct {
-  ssize_t  size;
+    ssize_t size;
 
-  offset_t o_collecting;
+    offset_t o_collecting;
 } py_gc_v;
 
 typedef struct {
-  py_code_v    py_code;
-  py_frame_v   py_frame;
-  py_thread_v  py_thread;
-  py_is_v      py_is;
-  py_runtime_v py_runtime;
-  py_gc_v      py_gc;
+    ssize_t size;
 
-  int          major;
-  int          minor;
-  int          patch;
+    offset_t o_used;  // number of active entries
+    offset_t o_table; // setentry* table
+    offset_t o_mask;  // table size - 1
+} py_set_v;
+
+typedef struct {
+    ssize_t size;
+
+    offset_t o_gi_iframe;      // suspended coroutine's top interpreter frame
+    offset_t o_gi_frame_state; // FRAME_SUSPENDED_YIELD_FROM et al -- see pycore_frame.h
+} py_gen_v;
+
+typedef struct {
+    offset_t o_next;
+    offset_t o_prev;
+} py_llist_v;
+
+typedef struct {
+    ssize_t  size;
+    ssize_t  ascii_size; // sizeof(PyASCIIObject) in target build
+    offset_t o_state;
+    offset_t o_length;
+    // True when PyUnicodeObject_state.interned is a full unsigned char (not
+    // 2-bit field). Introduced in CPython 3.14 free-threaded builds; changes
+    // kind/compact bit positions.
+    bool     ft_interned_byte;
+    // Byte offset within _PyUnicodeObject_state to the word holding
+    // kind:3/compact:1. Probed lazily on first FT string read: GCC/Clang packs
+    // the bits immediately after unsigned char interned; MSVC aligns unsigned
+    // int bitfields to +4. -1 means not yet probed.
+    int      ft_state_kind_byte;
+} py_unicode_v;
+
+typedef struct {
+    py_code_v    py_code;
+    py_frame_v   py_frame;
+    py_thread_v  py_thread;
+    py_is_v      py_is;
+    py_runtime_v py_runtime;
+    py_gc_v      py_gc;
+    py_cframe_v  py_cframe;
+    py_iframe_v  py_iframe;
+    py_unicode_v py_unicode;
+    py_set_v     py_set;
+    py_gen_v     py_gen;
+    py_llist_v   py_llist;
+
+    int major;
+    int minor;
+    int patch;
+
+    // Size of PyObject header in the target build (biased refcounting adds
+    // ob_tid + extra fields). Used to compute ob_size / string-data offsets
+    // without hardcoding the GIL layout.
+    ssize_t py_object_size;
+
+    // Offset of ob_type within PyObject -- used to identify what a suspended
+    // coroutine is awaiting (see py_asyncio.c's _py_asyncio__unwind_coro_chain).
+    ssize_t py_object_o_type;
 } python_v;
-
 
 #ifdef PY_PROC_C
 
-#define UNSUPPORTED_VERSION                                                    \
-  log_w("Unsupported Python version detected. Austin might not work as expected.")
+#define UNSUPPORTED_VERSION log_w("Unsupported Python version detected. Austin might not work as expected.")
 
-#define LATEST_VERSION                  (&python_v3_10)
+#define PY_CODE(s)                                                                                                   \
+    {sizeof(s), offsetof(s, co_filename), offsetof(s, co_name), offsetof(s, co_lnotab), offsetof(s, co_firstlineno)}
 
-#define PY_CODE(s) {                    \
-  sizeof(s),                            \
-  offsetof(s, co_filename),             \
-  offsetof(s, co_name),                 \
-  offsetof(s, co_lnotab),               \
-  offsetof(s, co_firstlineno)           \
-}
+#define PY_CODE_311(s)                 \
+    {                                  \
+        sizeof(s),                     \
+        offsetof(s, co_filename),      \
+        offsetof(s, co_name),          \
+        offsetof(s, co_linetable),     \
+        offsetof(s, co_firstlineno),   \
+        offsetof(s, co_code_adaptive), \
+        offsetof(s, co_qualname),      \
+    }
 
-#define PY_FRAME(s) {                   \
-  sizeof(s),                            \
-  offsetof(s, f_back),                  \
-  offsetof(s, f_code),                  \
-  offsetof(s, f_lasti),                 \
-  offsetof(s, f_lineno),                \
-}
+#define PY_FRAME(s)                                                                                       \
+    {                                                                                                     \
+        sizeof(s), offsetof(s, f_back), offsetof(s, f_code), offsetof(s, f_lasti), offsetof(s, f_lineno), \
+    }
 
-/* Hack. Python 3.3 and below don't have the prev field */
-#define PY_THREAD_2(s) {                \
-  sizeof(s),                            \
-  offsetof(s, next),                    \
-  offsetof(s, next),                    \
-  offsetof(s, interp),                  \
-  offsetof(s, frame),                   \
-  offsetof(s, thread_id)                \
-}
+#define PY_CFRAME_311(s)            \
+    {                               \
+        sizeof(s),                  \
+        offsetof(s, current_frame), \
+        offsetof(s, previous),      \
+    }
 
-#define PY_THREAD(s) {                  \
-  sizeof(s),                            \
-  offsetof(s, prev),                    \
-  offsetof(s, next),                    \
-  offsetof(s, interp),                  \
-  offsetof(s, frame),                   \
-  offsetof(s, thread_id)                \
-}
+#define PY_IFRAME_311(s)                                                                                                \
+    {                                                                                                                   \
+        sizeof(s),          offsetof(s, f_code), offsetof(s, previous), offsetof(s, prev_instr), offsetof(s, is_entry), \
+        offsetof(s, owner),                                                                                             \
+    }
 
-#define PY_UNICODE(n) {                 \
-  n                                     \
-}
+#define PY_IFRAME_312(s)                                                                                       \
+    {                                                                                                          \
+        sizeof(s), offsetof(s, f_code), offsetof(s, previous), offsetof(s, prev_instr), 0, offsetof(s, owner), \
+    }
 
-#define PY_BYTES(n) {                   \
-  n                                     \
-}
+#define PY_THREAD(s)                                                                                                   \
+    {sizeof(s), offsetof(s, prev), offsetof(s, next), offsetof(s, interp), offsetof(s, frame), offsetof(s, thread_id)}
 
-#define PY_RUNTIME(s) {                 \
-  sizeof(s),                            \
-  offsetof(s, interpreters.head),       \
-  offsetof(s, gc),                      \
-}
+#define PY_THREAD_311(s)               \
+    {                                  \
+        sizeof(s),                     \
+        offsetof(s, prev),             \
+        offsetof(s, next),             \
+        offsetof(s, interp),           \
+        offsetof(s, cframe),           \
+        offsetof(s, thread_id),        \
+        offsetof(s, native_thread_id), \
+        offsetof(s, datastack_chunk),  \
+    }
 
-#define PY_IS(s) {                      \
-  sizeof(s),                            \
-  offsetof(s, next),                    \
-  offsetof(s, tstate_head),             \
-  offsetof(s, gc),                      \
-}
+#define PY_THREAD_312(s)            \
+    {sizeof(s),                     \
+     offsetof(s, prev),             \
+     offsetof(s, next),             \
+     offsetof(s, interp),           \
+     offsetof(s, cframe),           \
+     offsetof(s, thread_id),        \
+     offsetof(s, native_thread_id), \
+     offsetof(s, datastack_chunk),  \
+     offsetof(s, _status)}
 
+#define PY_RUNTIME(s)                   \
+    {                                   \
+        sizeof(s),                      \
+        offsetof(s, interpreters.head), \
+        offsetof(s, gc),                \
+    }
 
-#define PY_GC(s) {                      \
-  sizeof(s),                            \
-  offsetof(s, collecting),              \
-}
+#define PY_RUNTIME_311(s)               \
+    {                                   \
+        sizeof(s),                      \
+        offsetof(s, interpreters.head), \
+    }
 
-// ---- Python 2 --------------------------------------------------------------
+// 3.10: interp->modules IS sys.modules directly (first pointer after gc)
+#define PY_IS(s)                                                                                                        \
+    {                                                                                                                   \
+        sizeof(s), offsetof(s, next), offsetof(s, tstate_head), offsetof(s, id), offsetof(s, gc), offsetof(s, modules), \
+    }
 
-python_v python_v2 = {
-  PY_CODE     (PyCodeObject2),
-  PY_FRAME    (PyFrameObject2),
-  PY_THREAD_2 (PyThreadState2),
-  PY_IS       (PyInterpreterState2),
-};
+// 3.11: same — modules is first pointer after gc
+#define PY_IS_311(s)                                                                                                     \
+    {                                                                                                                    \
+        sizeof(s), offsetof(s, next), offsetof(s, threads.head), offsetof(s, id), offsetof(s, gc), offsetof(s, modules), \
+    }
 
-// ---- Python 3.3 ------------------------------------------------------------
+// 3.12: no direct modules field; sysdict (first pointer after gc) gives sys.__dict__
+//       whose ["modules"] key reaches sys.modules.
+#define PY_IS_312(s)                                                                                  \
+    {                                                                                                 \
+        sizeof(s), offsetof(s, next),    offsetof(s, threads.head), offsetof(s, id), offsetof(s, gc), \
+        0,         offsetof(s, sysdict), offsetof(s, ceval.gil),                                      \
+    }
 
-python_v python_v3_3 = {
-  PY_CODE     (PyCodeObject3_3),
-  PY_FRAME    (PyFrameObject2),
-  PY_THREAD_2 (PyThreadState2),
-  PY_IS       (PyInterpreterState2),
-};
-
-// ---- Python 3.4 ------------------------------------------------------------
-
-python_v python_v3_4 = {
-  PY_CODE     (PyCodeObject3_3),
-  PY_FRAME    (PyFrameObject2),
-  PY_THREAD   (PyThreadState3_4),
-  PY_IS       (PyInterpreterState2),
-};
-
-// ---- Python 3.6 ------------------------------------------------------------
-
-python_v python_v3_6 = {
-  PY_CODE     (PyCodeObject3_6),
-  PY_FRAME    (PyFrameObject2),
-  PY_THREAD   (PyThreadState3_4),
-  PY_IS       (PyInterpreterState2),
-};
-
-// ---- Python 3.7 ------------------------------------------------------------
-
-python_v python_v3_7 = {
-  PY_CODE     (PyCodeObject3_6),
-  PY_FRAME    (PyFrameObject3_7),
-  PY_THREAD   (PyThreadState3_7),
-  PY_IS       (PyInterpreterState2),
-  PY_RUNTIME  (_PyRuntimeState3_7),
-  PY_GC       (struct _gc_runtime_state3_7),
-};
-
-// ---- Python 3.8 ------------------------------------------------------------
-
-python_v python_v3_8 = {
-  PY_CODE     (PyCodeObject3_8),
-  PY_FRAME    (PyFrameObject3_7),
-  PY_THREAD   (PyThreadState3_8),
-  PY_IS       (PyInterpreterState2),
-  PY_RUNTIME  (_PyRuntimeState3_8),
-  PY_GC       (struct _gc_runtime_state3_8),
-};
-
-// ---- Python 3.9 ------------------------------------------------------------
-
-python_v python_v3_9 = {
-  PY_CODE     (PyCodeObject3_8),
-  PY_FRAME    (PyFrameObject3_7),
-  PY_THREAD   (PyThreadState3_8),
-  PY_IS       (PyInterpreterState3_9),
-  PY_RUNTIME  (_PyRuntimeState3_8),
-  PY_GC       (struct _gc_runtime_state3_8),
-};
-
+#define PY_GC(s)                 \
+    {                            \
+        sizeof(s),               \
+        offsetof(s, collecting), \
+    }
 
 // ---- Python 3.10 -----------------------------------------------------------
 
 python_v python_v3_10 = {
-  PY_CODE     (PyCodeObject3_8),
-  PY_FRAME    (PyFrameObject3_10),
-  PY_THREAD   (PyThreadState3_8),
-  PY_IS       (PyInterpreterState3_9),
-  PY_RUNTIME  (_PyRuntimeState3_8),
-  PY_GC       (struct _gc_runtime_state3_8),
+    PY_CODE(PyCodeObject3_8),     PY_FRAME(PyFrameObject3_10),    PY_THREAD(PyThreadState3_8),
+    PY_IS(PyInterpreterState3_9), PY_RUNTIME(_PyRuntimeState3_8), PY_GC(struct _gc_runtime_state3_12),
 };
 
+// ---- Python 3.11 -----------------------------------------------------------
+
+python_v python_v3_11 = {
+    PY_CODE_311(PyCodeObject3_11),
+    PY_FRAME(PyFrameObject3_10), // Irrelevant
+    PY_THREAD_311(PyThreadState3_11),    PY_IS_311(PyInterpreterState3_11), PY_RUNTIME_311(_PyRuntimeState3_11),
+    PY_GC(struct _gc_runtime_state3_12), PY_CFRAME_311(_PyCFrame3_11),      PY_IFRAME_311(_PyInterpreterFrame3_11),
+};
+
+// ---- Python 3.12 -----------------------------------------------------------
+
+python_v python_v3_12 = {
+    PY_CODE_311(PyCodeObject3_12),
+    PY_FRAME(PyFrameObject3_10), // Irrelevant
+    PY_THREAD_312(PyThreadState3_12),    PY_IS_312(PyInterpreterState3_12), PY_RUNTIME_311(_PyRuntimeState3_12),
+    PY_GC(struct _gc_runtime_state3_12), PY_CFRAME_311(_PyCFrame3_12),      PY_IFRAME_312(_PyInterpreterFrame3_12),
+};
+
+// ---- Python 3.13 -----------------------------------------------------------
+
+python_v python_v3_13;
+
 // ----------------------------------------------------------------------------
-static inline python_v *
+static inline python_v*
 get_version_descriptor(int major, int minor, int patch) {
-  if (major == 0 && minor == 0)
-    return NULL;
+    log_d("Requested version descriptor for Python version %d.%d.%d", major, minor, patch);
 
-  python_v * py_v = NULL;
+    python_v* py_v = NULL;
 
-  switch (major) {
+    switch (major) {
 
-  // ---- Python 2 ------------------------------------------------------------
-  case 2:
-    switch (minor) {
-    case 0:
-    case 1:
-    case 2:
-      UNSUPPORTED_VERSION;  // NOTE: These versions haven't been tested.
-
-    // 2.3, 2.4, 2.5, 2.6, 2.7
+    // ---- Python 3 ------------------------------------------------------------
     case 3:
-    case 4:
-    case 5:
-    case 6:
-    case 7: py_v = &python_v2;
-      break;
+        switch (minor) {
+        // 3.10
+        case 10:
+            py_v = &python_v3_10;
+            break;
 
-    default: py_v = &python_v2;
-      UNSUPPORTED_VERSION;
+        // 3.11
+        case 11:
+            py_v = &python_v3_11;
+            break;
+
+        // 3.12
+        case 12:
+            py_v = &python_v3_12;
+            break;
+
+        // 3.13+ (filled in at runtime)
+        case 13:
+        case 14:
+        case 15:
+            py_v = &python_v3_13;
+            break;
+
+        default:                 // GCOV_EXCL_LINE
+            UNSUPPORTED_VERSION; // GCOV_EXCL_LINE
+        }
     }
-    break;
 
-  // ---- Python 3 ------------------------------------------------------------
-  case 3:
-    switch (minor) {
-    case 0:
-    case 1:
-    case 2:
-      UNSUPPORTED_VERSION;  // NOTE: These versions haven't been tested.
+    if (isvalid(py_v)) {
+        py_v->major = major;
+        py_v->minor = minor;
+        py_v->patch = patch;
 
-    // 3.3
-    case 3: py_v = &python_v3_3; break;
-
-    // 3.4, 3.5
-    case 4:
-    case 5: py_v = &python_v3_4; break;
-
-    // 3.6
-    case 6: py_v = &python_v3_6; break;
-
-    // 3.7
-    case 7: py_v = &python_v3_7; break;
-
-    // 3.8
-    case 8: py_v = &python_v3_8; break;
-    
-    //, 3.9
-    case 9: py_v = &python_v3_9; break;
-
-    // 3.10
-    case 10: py_v = &python_v3_10; break;
-
-    default: py_v = LATEST_VERSION;
-      UNSUPPORTED_VERSION;
+        // Default to the standard GIL PyObject header size. For Python 3.13+
+        // init_version_descriptor() reads the actual size from the debug
+        // offsets and overwrites this, handling free-threaded builds
+        // transparently.
+        py_v->py_object_size = sizeof(PyObject);
     }
-  }
 
-  py_v->major = major;
-  py_v->minor = minor;
-  py_v->patch = patch;
+    if (!isvalid(py_v)) { // GCOV_EXCL_START
+        set_error(VERSION, "Unsupported Python version");
+    } // GCOV_EXCL_STOP
 
-  return py_v;
+    return py_v;
 }
 
-#endif  // PY_PROC_C
+// ----------------------------------------------------------------------------
 
-#endif
+#define V_ASSIGN(ver, dst, src)                     \
+    {                                               \
+        py_v->py_##dst = py_d->v##ver.src;          \
+        log_d("py_%s = %ld", #dst, py_v->py_##dst); \
+    }
+
+#define PY_CODE_313(v)                                            \
+    {                                                             \
+        V_ASSIGN(v, code.size, code_object.size);                 \
+        V_ASSIGN(v, code.o_filename, code_object.filename);       \
+        V_ASSIGN(v, code.o_name, code_object.name);               \
+        V_ASSIGN(v, code.o_lnotab, code_object.linetable);        \
+        V_ASSIGN(v, code.o_firstlineno, code_object.firstlineno); \
+        V_ASSIGN(v, code.o_code, code_object.co_code_adaptive);   \
+        V_ASSIGN(v, code.o_qualname, code_object.qualname);       \
+    }
+
+#define PY_CODE_314(v)                                 \
+    {                                                  \
+        PY_CODE_313(v);                                \
+        V_ASSIGN(v, code.o_tlbc, code_object.co_tlbc); \
+    }
+
+#define PY_IFRAME_313(v)                                               \
+    {                                                                  \
+        V_ASSIGN(v, iframe.size, interpreter_frame.size);              \
+        V_ASSIGN(v, iframe.o_previous, interpreter_frame.previous);    \
+        V_ASSIGN(v, iframe.o_code, interpreter_frame.executable);      \
+        V_ASSIGN(v, iframe.o_prev_instr, interpreter_frame.instr_ptr); \
+        V_ASSIGN(v, iframe.o_owner, interpreter_frame.owner);          \
+    }
+
+#define PY_IFRAME_314(v)                                                    \
+    {                                                                       \
+        PY_IFRAME_313(v);                                                   \
+        V_ASSIGN(v, iframe.o_tlbc_index, interpreter_frame.tlbc_index);     \
+        V_ASSIGN(v, iframe.o_stackpointer, interpreter_frame.stackpointer); \
+    }
+
+#define PY_THREAD_313(v)                                                       \
+    {                                                                          \
+        V_ASSIGN(v, thread.size, thread_state.size);                           \
+        V_ASSIGN(v, thread.o_prev, thread_state.prev);                         \
+        V_ASSIGN(v, thread.o_next, thread_state.next);                         \
+        V_ASSIGN(v, thread.o_interp, thread_state.interp);                     \
+        V_ASSIGN(v, thread.o_frame, thread_state.current_frame);               \
+        V_ASSIGN(v, thread.o_thread_id, thread_state.thread_id);               \
+        V_ASSIGN(v, thread.o_native_thread_id, thread_state.native_thread_id); \
+        V_ASSIGN(v, thread.o_stack, thread_state.datastack_chunk);             \
+        V_ASSIGN(v, thread.o_status, thread_state.status);                     \
+    }
+
+#define PY_RUNTIME_313(v)                                                    \
+    {                                                                        \
+        V_ASSIGN(v, runtime.size, runtime_state.size);                       \
+        V_ASSIGN(v, runtime.o_interp_head, runtime_state.interpreters_head); \
+    }
+
+#define PY_IS_313(v)                                                          \
+    {                                                                         \
+        V_ASSIGN(v, is.size, interpreter_state.size);                         \
+        V_ASSIGN(v, is.o_next, interpreter_state.next);                       \
+        V_ASSIGN(v, is.o_tstate_head, interpreter_state.threads_head);        \
+        V_ASSIGN(v, is.o_id, interpreter_state.id);                           \
+        V_ASSIGN(v, is.o_gc, interpreter_state.gc);                           \
+        V_ASSIGN(v, is.o_imports_modules, interpreter_state.imports_modules); \
+        V_ASSIGN(v, is.o_gil_state, interpreter_state.ceval_gil);             \
+    }
+
+#define PY_IS_314(v)                                                                 \
+    {                                                                                \
+        PY_IS_313(v);                                                                \
+        V_ASSIGN(v, is.o_code_object_gen, interpreter_state.code_object_generation); \
+        V_ASSIGN(v, is.o_tlbc_generation, interpreter_state.tlbc_generation);        \
+    }
+
+#define PY_GC_313(v)                                 \
+    {                                                \
+        V_ASSIGN(v, gc.size, gc.size);               \
+        V_ASSIGN(v, gc.o_collecting, gc.collecting); \
+    }
+
+// PySetObject layout, used to walk a task's task_awaited_by set when a task
+// has more than one waiter (task_awaited_by_is_set). Not present in the 3.13
+// debug offsets; only needed from 3.14+ where asyncio introspection is used.
+#define PY_SET_314(v)                               \
+    {                                               \
+        V_ASSIGN(v, set.size, set_object.size);     \
+        V_ASSIGN(v, set.o_used, set_object.used);   \
+        V_ASSIGN(v, set.o_table, set_object.table); \
+        V_ASSIGN(v, set.o_mask, set_object.mask);   \
+    }
+
+// Suspended coroutine frame access (task.coro's gi_iframe) and the intrusive
+// llist_node used for the interpreter/thread-state asyncio task lists. Same
+// 3.14+ scoping as PY_SET_314, for the same reason (asyncio introspection).
+#define PY_GEN_314(v)                                                 \
+    {                                                                 \
+        V_ASSIGN(v, gen.size, gen_object.size);                       \
+        V_ASSIGN(v, gen.o_gi_iframe, gen_object.gi_iframe);           \
+        V_ASSIGN(v, gen.o_gi_frame_state, gen_object.gi_frame_state); \
+    }
+
+#define PY_LLIST_314(v)                             \
+    {                                               \
+        V_ASSIGN(v, llist.o_next, llist_node.next); \
+        V_ASSIGN(v, llist.o_prev, llist_node.prev); \
+    }
+
+#define PY_UNICODE_313(ver)                                                 \
+    {                                                                       \
+        V_ASSIGN(ver, unicode.size, unicode_object.size);                   \
+        V_ASSIGN(ver, unicode.ascii_size, unicode_object.asciiobject_size); \
+        V_ASSIGN(ver, unicode.o_state, unicode_object.state);               \
+        V_ASSIGN(ver, unicode.o_length, unicode_object.length);             \
+    }
+
+// In free-threaded 3.14+, PyUnicodeObject_state.interned became a full
+// unsigned char rather than a 2-bit field, shifting kind/compact bit positions.
+#define PY_UNICODE_314(ver)                                                         \
+    {                                                                               \
+        PY_UNICODE_313(ver);                                                        \
+        py_v->py_unicode.ft_interned_byte   = py_d->v##ver.pyobject.size > 16;      \
+        py_v->py_unicode.ft_state_kind_byte = -1; /* probed on first string read */ \
+    }
+
+// ----------------------------------------------------------------------------
+static void
+init_version_descriptor(python_v* py_v, _Py_DebugOffsets* py_d) {
+    switch (py_v->minor) {
+    case 13:
+        PY_CODE_313(3_13);
+        PY_IFRAME_313(3_13);
+        PY_THREAD_313(3_13);
+        PY_RUNTIME_313(3_13);
+        PY_IS_313(3_13);
+        PY_GC_313(3_13);
+        PY_UNICODE_313(3_13);
+        py_v->py_object_size   = py_d->v3_13.pyobject.size;
+        py_v->py_object_o_type = py_d->v3_13.pyobject.ob_type;
+        break;
+
+    case 14:
+        PY_CODE_314(3_14);
+        PY_IFRAME_314(3_14);
+        PY_THREAD_313(3_14);
+        PY_RUNTIME_313(3_14);
+        PY_IS_314(3_14);
+        PY_GC_313(3_14);
+        PY_UNICODE_314(3_14);
+        PY_SET_314(3_14);
+        PY_GEN_314(3_14);
+        PY_LLIST_314(3_14);
+        py_v->py_object_size   = py_d->v3_14.pyobject.size;
+        py_v->py_object_o_type = py_d->v3_14.pyobject.ob_type;
+        break;
+
+    case 15:
+        PY_CODE_314(3_15);
+        PY_IFRAME_314(3_15);
+        PY_THREAD_313(3_15);
+        PY_RUNTIME_313(3_15);
+        PY_IS_314(3_15);
+        PY_GC_313(3_15);
+        PY_UNICODE_314(3_15);
+        PY_SET_314(3_15);
+        PY_GEN_314(3_15);
+        PY_LLIST_314(3_15);
+        py_v->py_object_size   = py_d->v3_15.pyobject.size;
+        py_v->py_object_o_type = py_d->v3_15.pyobject.ob_type;
+        break;
+
+    default:                                                                           // GCOV_EXCL_LINE
+        log_e("Unsupported Python version %d.%d detected.", py_v->major, py_v->minor); // GCOV_EXCL_LINE
+    }
+}
+
+#endif // PY_PROC_C

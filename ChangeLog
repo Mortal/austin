@@ -1,3 +1,133 @@
+2026-10-27 v4.1.0
+
+  Added support for CPython 3.15.
+
+  Dropped support for CPython 3.9.
+
+  Added support for free-threaded CPython builds.
+
+  Added the --native/-n option to collect native call stacks alongside Python
+  stacks on on Linux (x86_64 and aarch64), macOS and Windows (x86_64);
+  non-Python threads are sampled too.
+
+  Added asyncio support for CPython 3.14 and above.
+
+  Added the Python thread names to the collected samples.
+
+  Improved support for Linux containers.
+
+  Added the cwd, venv and pythonpath metadata fields to help tools resolve
+  file paths.
+
+  Improved performance with the detection of repeated stacks and buffered
+  output, allowing for higher sampling rates and smaller output files.
+
+  Bugfix: improved CPython detection on MacOS.
+
+  Bugfix: fixed a bug that caused Austin to fail to sample a newly spawned
+  process on MacOS.
+
+
+2025-10-31 v4.0.0
+
+  Added support for CPython 3.14.
+  
+  Dropped support for CPython 3.8.
+
+  The MOJO binary output format is now the default. The augmented collapsed
+  stack format is no longer supported.
+
+  The --sleepless/-s option has been replaced with the --cpu/-c option.
+
+  Removed the heap option.
+
+  Improved accuracy and performance by more than doubling the maximum attainable
+  sampling rate.
+
+  Added support for the exec system call.
+
+  Bugfix: fixed a bug that caused Austin to fail to attach to a MacOS process
+  for a second time with CPython 3.13.
+
+  Bugfix: fixed a bug that caused the sampling to halt if Austin failed to
+  retrieve valid thread information.
+
+
+2024-10-14 v3.7.0
+
+  Added support for CPython 3.13.
+
+  Improve support for Python processes running in containers.
+
+  Removed the exclude-empty option.
+
+  Bugfix: fixed a bug with the MOJO binary format that caused the line end
+  position to wrongly be set to a non-zero value for CPython < 3.11, where line
+  end information is not actually available.
+
+
+2023-10-04 v3.6.0
+
+  Added support for CPython 3.12
+
+  Added support for sub-interpreters.
+
+  Dropped support for CPython 2, 3.3, 3.4, 3.5, 3.6 and 3.7.
+
+  Improved interpreter detection and general stability on all supported
+  platforms.
+
+  Bugfix: ensure that threads are resumed by austinp when an error occurs during
+  the sampling process.
+
+  Bugfix: propagate the termination signal to the child process when launching a
+  command with Austin to prevent it from running indefinitely in the background.
+
+
+2023-02-21 v3.5.0
+
+  Added support for fine-grained, column-level location information when
+  exporting samples in binary mode.
+
+  Improved multiprocess support.
+
+  Dropped the alternative output format.
+
+  Improved interpreter detection on all supported platforms.
+
+
+2022-10-26 v3.4.1
+
+  Fixed a bug with the MOJO binary format.
+
+
+2022-10-25 v3.4.0
+
+  Added support for Python 3.11.
+
+  Allowed disabling logging by setting the environment variable
+  AUSTIN_NO_LOGGING.
+
+  Improved permission error reporting on MacOS.
+
+  Improved MacOS support.
+
+  Improved austinp support on fork.
+
+  Small performance improvements.
+
+  Renamed the austinp binary installed from the Snap Store from austin.austinp
+  to austin.p.
+  
+  Fixed a bug in austinp that could have caused the interpreter to stall on
+  launch.
+
+  Fixed a bug in austinp that could have caused segmentation faults.
+
+  Fixed a regression in austinp that caused most of the samples to be wrongly
+  reported as idle
+
+
 2022-01-28 v3.3.0
 
   Added the new Where mode.

@@ -27,12 +27,12 @@ import threading
 
 def keep_cpu_busy():
     a = []
-    for i in range(2000000):
+    for i in range(10_000_000):
         a.append(i)
         if i % 1000000 == 0:
             print("Unwanted output " + str(i))
 
 
 if __name__ == "__main__":
-    threading.Thread(target=keep_cpu_busy).start()
+    threading.Thread(target=keep_cpu_busy, name="SecondThread").start()
     keep_cpu_busy()

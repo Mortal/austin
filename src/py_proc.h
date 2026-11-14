@@ -20,103 +20,157 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-#ifndef PY_PROC_H
-#define PY_PROC_H
+#pragma once
 
-
+#include <stdbool.h>
 #include <sys/types.h>
 
-#ifdef NATIVE
-#include <libunwind-ptrace.h>
+#include "cache.h"
+#include "py_interp.h"
+#include "thread_tracker.h"
+#ifdef PL_LINUX
 #include "linux/vm-range-tree.h"
-#include "cache.h"
+#ifdef AUSTINP
+#include <libunwind-ptrace.h>
 #endif
-
-#include "cache.h"
-#include "heap.h"
+#endif
+#include "platform.h"
+#include "python/asyncio.h"
+#include "python/symbols.h"
 #include "stats.h"
+#include "task_tracker.h"
 #include "version.h"
 
-
 typedef struct {
-  void    * base;
-  ssize_t   size;
+    raddr_t base;
+    ssize_t size;
 } proc_vm_map_block_t;
 
-
 typedef struct {
-  proc_vm_map_block_t bss;
-  proc_vm_map_block_t heap;
-  proc_vm_map_block_t elf;
-  proc_vm_map_block_t dynsym;
-  proc_vm_map_block_t rodata;
+    proc_vm_map_block_t bss;
+    proc_vm_map_block_t exe;
+    proc_vm_map_block_t dynsym;
+    proc_vm_map_block_t rodata;
+    proc_vm_map_block_t runtime;       // Added in Python 3.11
+    proc_vm_map_block_t asyncio_debug; // AsyncioDebug section in the _asyncio module, 3.14+
 } proc_vm_map_t;
 
-typedef struct _proc_extra_info proc_extra_info;  // Forward declaration.
+typedef struct {
+    size_t base_offset;
+    size_t size;
+    void*  data;
+} com_t;
+
+typedef struct _proc_extra_info proc_extra_info; // Forward declaration.
 
 typedef struct {
-  pid_t           pid;
-  int             child;
+    pid_t      pid;
+    proc_ref_t ref;
+    bool       child;
 
-  char          * bin_path;
-  char          * lib_path;
+    char* bin_path;
+    char* lib_path;
 
-  proc_vm_map_t   map;
-  void          * min_raddr;
-  void          * max_raddr;
+    proc_vm_map_t map;
 
-  void          * bss;  // local copy of the remote bss section
+    int       sym_loaded;
+    python_v* py_v;
 
-  int             sym_loaded;
-  python_v      * py_v;
+    raddr_t symbols[DYNSYM_COUNT]; // Binary symbols
 
-  // Symbols from .dynsym
-  void          * tstate_curr_raddr;
-  void          * py_runtime_raddr;
-  void          * interp_head_raddr;
-  void          * gc_state_raddr;
+    raddr_t gc_state_raddr;
 
-  void          * is_raddr;
+    raddr_t istate_raddr;
 
-  lru_cache_t   * frame_cache;
+    lru_cache_t*         frame_cache;
+    lru_cache_t*         string_cache;
+    lru_cache_t*         code_cache;
+    lru_cache_t*         interpreter_state_cache;
+    thread_tracker_t*    thread_tracker;
+    interpreter_state_t* current_interp_state; // set per-interpreter during sampling
+    // Temporal profiling support
+    microseconds_t       timestamp;
 
-  // Temporal profiling support
-  ctime_t         timestamp;
+    // Memory profiling support
+    ssize_t last_resident_memory;
+    // Thread counts from the last sample that split the memory delta across
+    // threads (GIL disabled).
+    int     mem_split_threads;
+    int     mem_split_running;
 
-  // Memory profiling support
-  ssize_t         last_resident_memory;
+    // Offset of the tstate_current field within the _PyRuntimeState structure
+    unsigned int tstate_current_offset;
 
-  // Offset of the tstate_current field within the _PyRuntimeState structure
-  unsigned int    tstate_current_offset;
+    bool free_threaded;
 
-  // Frame objects VM ranges
-  _mem_block_t    frames;
-  _mem_block_t    frames_heap;
+    // Whether we have already warned about memory mode with the GIL disabled.
+    bool gil_disabled_warned;
 
-  #ifdef NATIVE
-  struct _puw {
-    unw_addr_space_t as;
-  }                 unwind;
-  vm_range_tree_t * maps_tree;
-  hash_table_t    * base_table;
-  #endif
+    // Non-Python thread sampling.
+    //
+    // The full OS thread enumeration (e.g. CreateToolhelp32Snapshot on Windows)
+    // is expensive and only runs when non_python_scan_deadline is reached.
+    // Between scans, known non-Python TIDs are re-interrupted directly from the
+    // cache, avoiding the enumeration entirely.
+    microseconds_t non_python_scan_deadline;
+    uintptr_t      non_python_tids[MAX_THREAD_TRACKER];
+    int            non_python_n;
 
-  // Platform-dependent fields
-  proc_extra_info * extra;
+    uint64_t tlbc_generation; // current interpreter tlbc_generation (3.14+ FT)
+
+    // Set by the platform thread-suspend code (Linux: _py_thread__suspend)
+    // the moment it observes a thread report the kernel's mandatory
+    // post-exec ptrace stop. A process that execs in place gets a fresh
+    // ASLR base, so every cached address we hold (istate_raddr, bin_path,
+    // symbols, ...) is now wrong -- but that doesn't make sampling fail
+    // outright, since the stale thread-state head can easily still look
+    // like a plausible (non-NULL) pointer and simply walk into garbage.
+    // py_proc__sample checks and clears this flag once per call to force
+    // full re-discovery (py_proc__init) as soon as an exec is observed,
+    // rather than trying to infer staleness from the data it produces.
+    bool exec_seen;
+
+    // Asyncio introspection support (3.14+).
+    //
+    // The _asyncio extension module is loaded lazily (on `import asyncio`),
+    // so its AsyncioDebug section may not be mapped yet at attach time. We
+    // retry the scan on a Fibonacci backoff (see ASYNCIO_SCAN_BACKOFF_* in
+    // py_asyncio.h) until it is found, or until asyncio_scan_started_at is
+    // old enough that we fall back to a sparse indefinite poll instead of
+    // giving up outright. Once found, no further scanning is needed.
+    bool           asyncio_debug_found;
+    microseconds_t asyncio_scan_deadline;      // next allowed scan attempt
+    microseconds_t asyncio_scan_started_at;    // when discovery began; 0 == not started yet
+    microseconds_t asyncio_scan_interval;      // current backoff interval (the one just used)
+    microseconds_t asyncio_scan_prev_interval; // previous backoff interval, for computing the next Fibonacci step
+    Py_AsyncioModuleDebugOffsets asyncio_offsets;
+    task_tracker_t*              task_tracker; // per-task identity cache; see task_tracker.h
+
+#ifdef PL_LINUX
+#ifdef AUSTINP
+    struct _puw {
+        unw_addr_space_t as;
+    } unwind;
+#endif
+    vm_range_tree_t* maps_tree;
+#endif
+
+    com_t interpreter_state_com;
+
+    // Platform-dependent fields
+    proc_extra_info* extra;
 } py_proc_t;
-
 
 /**
  * Create a new process object. Use it to start the process that needs to be
  * sampled from austin.
- * 
+ *
  * @param child  whether this is a child process.
  *
  * @return a pointer to the newly created py_proc_t object.
  */
-py_proc_t *
-py_proc_new(int child);
-
+py_proc_t*
+py_proc_new(bool child);
 
 /**
  * Start the process
@@ -128,8 +182,7 @@ py_proc_new(int child);
  * @return 0 on success.
  */
 int
-py_proc__start(py_proc_t *, const char *, char **);
-
+py_proc__start(py_proc_t*, const char*, char**);
 
 /**
  * Attach the process with the given PID
@@ -140,8 +193,7 @@ py_proc__start(py_proc_t *, const char *, char **);
  * @return 0 on success.
  */
 int
-py_proc__attach(py_proc_t *, pid_t);
-
+py_proc__attach(py_proc_t*, pid_t);
 
 /**
  * Wait for the process to terminate.
@@ -149,44 +201,40 @@ py_proc__attach(py_proc_t *, pid_t);
  * @param py_proc_t * the process object.
  */
 void
-py_proc__wait(py_proc_t *);
-
+py_proc__wait(py_proc_t*);
 
 /**
  * Check if the process is still running.
  *
  * @param py_proc_t * the process object.
  *
- * @return 1 if the process is still running, 0 otherwise.
+ * @return true if the process is still running, false otherwise.
  */
-int
-py_proc__is_running(py_proc_t *);
-
+bool
+py_proc__is_running(py_proc_t*);
 
 /**
  * Check if the process is a Python process.
  *
  * @param py_proc_t * the process object.
  *
- * @return 1 if the process is a Python process, 0 otherwise.
+ * @return true if the process is a Python process, false otherwise.
  */
-int
-py_proc__is_python(py_proc_t *);
-
+bool
+py_proc__is_python(py_proc_t*);
 
 /**
  * Check whether the GC is collecting for the given process.
- * 
+ *
  * NOTE: This method makes sense only for Python>=3.7.
- * 
+ *
  * @param py_proc_t * the process object.
- * 
- * @return TRUE if the GC is collecting, FALSE otherwise.
- * 
+ *
+ * @return true if the GC is collecting, false otherwise.
+ *
  */
-int
-py_proc__is_gc_collecting(py_proc_t *);
-
+bool
+py_proc__is_gc_collecting(py_proc_t*);
 
 /**
  * Sample the frame stack of each thread of the given Python process.
@@ -196,8 +244,17 @@ py_proc__is_gc_collecting(py_proc_t *);
  * @return 0 if the sampling succeeded; 1 otherwise.
  */
 int
-py_proc__sample(py_proc_t *);
+py_proc__sample(py_proc_t*);
 
+/**
+ * Initialise the process. Useful after an exec.
+ *
+ * @param  py_proc_t * self
+ *
+ * @return 0 on success; 1 otherwise
+ */
+int
+py_proc__init(py_proc_t*);
 
 /**
  * Get a datatype from the process
@@ -211,13 +268,53 @@ py_proc__sample(py_proc_t *);
 #define py_proc__get_type(self, raddr, dt) (py_proc__memcpy(self, raddr, sizeof(dt), &dt))
 
 /**
+ * Make a local copy of a remote structure.
+ *
+ * @param self  the process object.
+ * @param type  the type of the structure.
+ * @param raddr the remote address of the structure.
+ * @param dest  the destination address.
+ *
+ * @return 0 on success.
+ */
+#define py_proc__copy_v(self, type, raddr, dest) (py_proc__memcpy(self, raddr, py_v->py_##type.size, dest))
+
+/**
+ * Copy a field from a versioned Python data structure.
+ * @param self   the process object.
+ * @param type   the versioned Python type (e.g. runtime).
+ * @param field  the field name (e.g. interp_head).
+ * @param raddr  the remote address of the versioned Python data structure.
+ * @param dst    the destination variable.
+
+ * @return        zero on success, otherwise non-zero.
+ */
+#define py_proc__copy_field_v(self, type, field, raddr, dst) copy_field_v(self->ref, type, field, raddr, dst)
+
+/**
  * Log the Python interpreter version
  * @param self  the process object.
- * @param int   whether the process is the parent process.
+ * @param bool  whether the process is the parent process.
  */
 void
-py_proc__log_version(py_proc_t *, int);
+py_proc__log_version(py_proc_t*, bool);
 
+/**
+ * Log the working directory, virtual environment and Python path of the
+ * process as metadata.
+ * @param self  the process object.
+ */
+void
+py_proc__log_paths(py_proc_t*);
+
+/**
+ * Send a signal to the process.
+ *
+ * @param py_proc_t * the process object.
+ * @param int         the signal to send to the process.
+ */
+void
+py_proc__signal(py_proc_t*, int);
 
 /**
  * Terminate the process.
@@ -225,10 +322,7 @@ py_proc__log_version(py_proc_t *, int);
  * @param py_proc_t * the process object.
  */
 void
-py_proc__terminate(py_proc_t *);
-
+py_proc__terminate(py_proc_t*);
 
 void
-py_proc__destroy(py_proc_t *);
-
-#endif // PY_PROC_H
+py_proc__destroy(py_proc_t*);

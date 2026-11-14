@@ -22,6 +22,9 @@
 
 #define _DEFAULT_SOURCE
 
+#include "austin.h"
+#include "env.h"
+#include "events.h"
 #include "mem.h"
 #include "platform.h"
 
@@ -32,161 +35,195 @@
 #include <syslog.h>
 
 #else
+#include <time.h>
 #include <windows.h>
-#include <stdio.h>
 
-#define LOG_EMERG   0  /* system is unusable */
-#define LOG_ALERT   1  /* action must be taken immediately */
-#define LOG_CRIT    2  /* critical conditions */
-#define LOG_ERR     3  /* error conditions */
-#define LOG_WARNING 4  /* warning conditions */
-#define LOG_NOTICE  5  /* normal but significant condition */
-#define LOG_INFO    6  /* informational */
-#define LOG_DEBUG   7  /* debug-level messages */
+#define LOG_EMERG   0 /* system is unusable */
+#define LOG_ALERT   1 /* action must be taken immediately */
+#define LOG_CRIT    2 /* critical conditions */
+#define LOG_ERR     3 /* error conditions */
+#define LOG_WARNING 4 /* warning conditions */
+#define LOG_NOTICE  5 /* normal but significant condition */
+#define LOG_INFO    6 /* informational */
+#define LOG_DEBUG   7 /* debug-level messages */
 
-FILE * logfile = NULL;
+FILE* logfile = NULL;
 #endif
 
-#include "austin.h"
 #include "logging.h"
 
-
 void
-_log_writer(int prio, const char * fmt, va_list ap) {
-  #ifdef PL_UNIX
-  vsyslog(prio, fmt, ap);
+_log_writer(int prio, const char* fmt, va_list ap) {
+    if (!env.logging)
+        return;
+#ifdef PL_UNIX
+    vsyslog(prio, fmt, ap);
 
-  #else
-  if (logfile == NULL) {
-    vfprintf(stderr, fmt, ap); fputc('\n', stderr);
-    fflush(stderr);
-  }
-  else {
-    vfprintf(logfile, fmt, ap); fputc('\n', logfile);
-    fflush(logfile);
-  }
+#else
+    time_t     timer;
+    char       buffer[32];
+    struct tm* tm_info;
 
-  #endif
+    timer   = time(NULL);
+    tm_info = localtime(&timer);
+
+    strftime(buffer, 26, "%Y-%m-%d %H:%M:%S", tm_info);
+
+    FILE* stream = isvalid(logfile) ? logfile : stderr;
+
+    // Timestamp
+    fputs(buffer, stream);
+
+    // Process info
+    fprintf(stream, " " PROGRAM_NAME "[%ld]: ", GetCurrentProcessId());
+
+    // Log message
+    vfprintf(stream, fmt, ap);
+
+    // Newline
+    fputc('\n', stream);
+
+    // Flush
+    fflush(stream);
+
+#endif
 }
-
 
 void
 logger_init(void) {
-  #ifdef PL_UNIX
-  setlogmask (LOG_UPTO (LOG_DEBUG));
-  openlog ("austin", LOG_CONS | LOG_PID | LOG_NDELAY, LOG_LOCAL1);
+#ifdef PL_UNIX
+    setlogmask(LOG_UPTO(LOG_DEBUG));
+    openlog(PROGRAM_NAME, LOG_CONS | LOG_PID | LOG_NDELAY, LOG_LOCAL1);
 
-  #else
-  if (logfile == NULL) {
-    char path[MAX_PATH];
-    ExpandEnvironmentStrings("%TEMP%\\austin.log", path, MAX_PATH);
-    logfile = fopen(path, "a");
-  }
-  #endif
+#else
+    if (logfile == NULL) {
+        char path[MAX_PATH];
+        ExpandEnvironmentStrings("%TEMP%\\austin.log", path, MAX_PATH);
+        logfile = fopen(path, "a");
+    }
+#endif
 }
 
-
 void
-log_f(const char * fmt, ...) {
-  va_list args;
+log_f(const char* fmt, ...) {
+    va_list args;
 
-  va_start(args, fmt);
+    va_start(args, fmt);
     _log_writer(LOG_CRIT, fmt, args);
-  va_end(args);
+    va_end(args);
 }
 
 void
-log_e(const char * fmt, ...) {
-  va_list args;
-  va_start(args, fmt);
+log_e(const char* fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
 
-  _log_writer(LOG_ERR, fmt, args);
+    _log_writer(LOG_ERR, fmt, args);
 
-  va_end(args);
+    va_end(args);
 }
 
 void
-log_w(const char * fmt, ...) {
-  va_list args;
-  va_start(args, fmt);
+log_w(const char* fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
 
-  _log_writer(LOG_WARNING, fmt, args);
+    _log_writer(LOG_WARNING, fmt, args);
 
-  va_end(args);
+    va_end(args);
 }
 
 void
-log_i(const char * fmt, ...) {
-  va_list args;
-  va_start(args, fmt);
+log_i(const char* fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
 
-  _log_writer(LOG_INFO, fmt, args);
+    _log_writer(LOG_INFO, fmt, args);
 
-  va_end(args);
+    va_end(args);
 }
 
 void
-log_m(const char * fmt, ...) {
-  va_list args;
+log_m(const char* fmt, ...) {
+    va_list args;
 
-  va_start(args, fmt);
-    vfprintf(stderr, fmt, args); fputc('\n', stderr);
+    if (pargs.pipe)
+        return;
+
+    va_start(args, fmt);
+    vfprintf(stderr, fmt, args);
+    fputc('\n', stderr);
     fflush(stderr);
-  va_end(args);
+    va_end(args);
 }
 
 #ifdef DEBUG
 void
-log_d(const char * fmt, ...) {
-  va_list args;
-  va_start(args, fmt);
+log_d(const char* fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
 
-  _log_writer(LOG_DEBUG, fmt, args);
+    _log_writer(LOG_DEBUG, fmt, args);
 
-  va_end(args);
+    va_end(args);
 }
 #endif
 
 #ifdef TRACE
 void
-log_t(const char * fmt, ...) {
-  va_list args;
-  va_start(args, fmt);
+log_t(const char* fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
 
-  _log_writer(LOG_DEBUG, fmt, args);
+    _log_writer(LOG_DEBUG, fmt, args);
 
-  va_end(args);
+    va_end(args);
 }
 #endif
 
-
 void
 logger_close(void) {
-  #ifdef PL_UNIX
-  closelog();
+    if (!env.logging)
+        return;
+#ifdef PL_UNIX
+    closelog();
 
-  #else
-  if (logfile != NULL)
-    fclose(logfile);
-  #endif
+#else
+    if (logfile != NULL)
+        fclose(logfile);
+#endif
 }
 
 #if defined PL_WIN
-#define MEM_VALUE "%I64d"
+#define MEM_VALUE "%llu"
 #else
-#define MEM_VALUE "%lu"
+#define MEM_VALUE "%zu"
 #endif
 
 void
 log_meta_header(void) {
-  meta("austin: " VERSION);
-  meta("interval: %lu", pargs.t_sampling_interval);
+    if (pargs.where)
+        return;
 
-  if (pargs.full)           { meta("mode: full"); }
-  else if (pargs.memory)    { meta("mode: memory"); }
-  else if (pargs.sleepless) { meta("mode: cpu"); }
-  else                      { meta("mode: wall"); }
+    event_handler__emit_metadata("austin", VERSION);
+    event_handler__emit_metadata("interval", MICROSECONDS_FMT, pargs.t_sampling_interval);
 
-  if (pargs.memory || pargs.full) { meta("memory: " MEM_VALUE, get_total_memory()); }
-  if (pargs.children) { meta("multiprocess: on"); }
+    if (pargs.full) {
+        event_handler__emit_metadata("mode", "full");
+    } else if (pargs.memory) {
+        event_handler__emit_metadata("mode", "memory");
+    } else if (pargs.cpu) {
+        event_handler__emit_metadata("mode", "cpu");
+    } else {
+        event_handler__emit_metadata("mode", "wall");
+    }
+
+    if (pargs.memory || pargs.full)
+        event_handler__emit_metadata("memory", MEM_VALUE, get_total_memory());
+
+    if (pargs.children)
+        event_handler__emit_metadata("multiprocess", "on");
+
+    if (pargs.gc)
+        event_handler__emit_metadata("gc", "on");
 }
